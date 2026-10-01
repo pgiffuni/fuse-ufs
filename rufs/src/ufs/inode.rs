@@ -151,10 +151,18 @@ impl<R: Backend> Ufs<R> {
 		Ok(flen)
 	}
 
+	/// Read an inode.
+	///
+	/// Through the metadata cache, so an inode that has been written but not
+	/// yet persisted — because a Soft Updates dependency still gates part of it
+	/// — reads back exactly as it was written.  Every caller depends on that:
+	/// `dir_iter`, `check_consistency`, the allocation policies and the
+	/// mapping layer all have to see the filesystem's current state, not the
+	/// last image that reached the disk.
 	pub(super) fn read_inode(&mut self, inr: InodeNum) -> IoResult<Inode> {
 		log::trace!("read_inode({inr});");
 		let off = self.superblock.ino_to_fso(inr);
-		let ino: Inode = self.file.decode_at(off)?;
+		let ino: Inode = self.metadata_read(off)?;
 		let mode = ino.mode;
 
 		if (mode & S_IFMT) == 0 {
@@ -165,11 +173,17 @@ impl<R: Backend> Ufs<R> {
 		Ok(ino)
 	}
 
+	/// Stage an inode.
+	///
+	/// An inode occupies `UFS_INOSZ` bytes of a shared inode block, so this is
+	/// a read-modify-write of exactly that range: the `fs_inopb - 1` other
+	/// inodes in the block must survive untouched, which is what the cache's
+	/// whole-block view gives us.  It does not persist anything.
 	pub(super) fn write_inode(&mut self, inr: InodeNum, ino: &Inode) -> IoResult<()> {
 		log::trace!("write_inode({inr});");
 		self.assert_rw()?;
 		let off = self.superblock.ino_to_fso(inr);
-		self.file.encode_at(off, &ino)?;
+		self.metadata_write(off, &ino)?;
 		Ok(())
 	}
 

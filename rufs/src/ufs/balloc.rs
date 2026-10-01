@@ -343,28 +343,49 @@ impl<R: Backend> Ufs<R> {
 	// ------------------------------------------------------------ CG accessors
 
 	/// Read a cylinder-group superblock.
+	///
+	/// Goes through the metadata cache, so a cylinder group whose struct is
+	/// dirty but not yet persistent reads back as the allocator last wrote it.
+	/// Every mutation below reaches the device only via
+	/// [`Ufs::sync_metadata`], so this cache-backed read is what keeps the
+	/// running filesystem and the disk from disagreeing about `cs_nbfree`.
 	pub(super) fn read_cg(&mut self, cg: CgNum) -> IoResult<CylGroup> {
-		self.file.decode_at(self.superblock.cg_addr(cg))
+		self.metadata_read(self.superblock.cg_addr(cg))
 	}
 
-	/// Write a cylinder-group superblock and keep the summary cache in sync.
+	/// Stage a cylinder-group superblock and keep the summary cache in sync.
 	///
 	/// Every mutation of a cylinder group *must* go through here; the cached
 	/// [`CgSums`] that the allocation policies read is derived from exactly
 	/// these structures, so funnelling the writes is what keeps the cache
 	/// honest.
+	///
+	/// This does **not** persist anything.  It serializes the struct and copies
+	/// it into the cached block, which is now dirty; whether that block may
+	/// reach the device is [`Ufs::sync_metadata`]'s decision.  That is the
+	/// difference between this and the `encode_at` it replaces, and it is what
+	/// makes a cylinder-group bitmap update a *step* in a dependency chain
+	/// rather than an immediate disk write.
 	pub(super) fn write_cg(&mut self, cg: CgNum, cgd: &CylGroup) -> IoResult<()> {
 		log::trace!("write_cg({cg}): cs={:?}", cgd.cs);
-		self.file.encode_at(self.superblock.cg_addr(cg), cgd)?;
+		self.metadata_write(self.superblock.cg_addr(cg), cgd)?;
 		self.cg_sums.set(cg, cgd.cs);
 		Ok(())
 	}
 
 	/// Read the block bitmap of a cylinder group into memory.
+	///
+	/// Through the cache, because the bitmap lives in the *same* `fs_bsize`
+	/// block as the cylinder-group struct that [`Ufs::write_cg`] stages.  A
+	/// read that went straight to the device would miss an unflushed bitmap
+	/// change, and — worse — a later write-back of the cached block would
+	/// silently roll the bitmap back to whatever it was when the block was
+	/// fetched.  Two writers to one block is exactly the situation the
+	/// metadata cache exists to eliminate.
 	pub(super) fn read_blkmap(&mut self, cg: CgNum, cgd: &CylGroup) -> IoResult<BlkMap> {
 		let addr = self.superblock.cg_addr(cg) + cgd.freeoff as u64;
-		let mut map = vec![0u8; bytes_for(self.superblock.fpg()) as usize];
-		self.file.read_at(addr, &mut map)?;
+		let map = self.metadata_read_at(addr, bytes_for(self.superblock.fpg()) as usize)?;
+		debug_assert_eq!(map.len() as u64, bytes_for(self.superblock.fpg()));
 		Ok(BlkMap::from_bytes(
 			map,
 			self.superblock.frag(),
@@ -372,16 +393,34 @@ impl<R: Backend> Ufs<R> {
 		))
 	}
 
+	/// Stage the block bitmap of a cylinder group.
+	///
+	/// The inverse of [`Self::read_blkmap`], and the same cache block: the
+	/// bitmap is written back with the cylinder-group struct it belongs to, or
+	/// not at all.
+	pub(super) fn write_blkmap(&mut self, cg: CgNum, cgd: &CylGroup, map: &BlkMap) -> IoResult<()> {
+		let addr = self.superblock.cg_addr(cg) + cgd.freeoff as u64;
+		self.metadata_write_at(addr, map.as_bytes())
+	}
+
 	/// Read the inode bitmap of a cylinder group into memory.
+	///
+	/// See [`Self::read_blkmap`] for why this reads through the cache.
 	pub(super) fn read_inomap(&mut self, cg: CgNum, cgd: &CylGroup) -> IoResult<InoMap> {
 		let addr = self.superblock.cg_addr(cg) + cgd.iusedoff as u64;
-		let mut map = vec![0u8; bytes_for(self.superblock.ipg()) as usize];
-		self.file.read_at(addr, &mut map)?;
+		let map = self.metadata_read_at(addr, bytes_for(self.superblock.ipg()) as usize)?;
+		debug_assert_eq!(map.len() as u64, bytes_for(self.superblock.ipg()));
 		Ok(InoMap::from_bytes(
 			map,
 			self.superblock.ipg(),
 			cgd.irotor as u64,
 		))
+	}
+
+	/// Stage the inode bitmap of a cylinder group.
+	pub(super) fn write_inomap(&mut self, cg: CgNum, cgd: &CylGroup, map: &InoMap) -> IoResult<()> {
+		let addr = self.superblock.cg_addr(cg) + cgd.iusedoff as u64;
+		self.metadata_write_at(addr, map.as_bytes())
 	}
 
 	// ------------------------------------------------------------------ policy
@@ -514,9 +553,8 @@ impl<R: Backend> Ufs<R> {
 		bno: u64,
 		rotor: Option<u32>,
 	) -> IoResult<NonZeroU64> {
-		let addr = self.superblock.cg_addr(cg) + cgd.freeoff as u64;
 		let cg_start = self.superblock.cg_start(cg);
-		self.file.write_at(addr, map.as_bytes())?;
+		self.write_blkmap(cg, cgd, map)?;
 		if let Some(r) = rotor {
 			cgd.rotor = r;
 		}
@@ -619,8 +657,14 @@ impl<R: Backend> Ufs<R> {
 		// there before, and `inode_free_l1()` would later walk those stale
 		// "pointers" and free blocks that belong to somebody else.
 		let bs = self.superblock.bsize() as usize;
-		self.file
-			.fill_at(blkno.get() * self.superblock.fsize(), 0u8, bs)?;
+		//
+		// Through the metadata cache, because this block is about to become an
+		// indirect block.  Filling it directly would be wrong twice over: it
+		// would bypass the cache for a block the cache will own from here on,
+		// and if the block were still resident from a previous life, the next
+		// write-back would restore the old pointers and re-arm references to
+		// blocks that have since been freed.
+		self.metadata_fill_at(blkno.get() * self.superblock.fsize(), 0u8, bs)?;
 		Ok(blkno)
 	}
 
@@ -636,7 +680,7 @@ impl<R: Backend> Ufs<R> {
 			return Ok(());
 		}
 
-		let (cg, off, cg_addr) = {
+		let (cg, off) = {
 			let sb = &self.superblock;
 			let bsize = sb.bsize();
 			assert_ne!(size, 0);
@@ -650,12 +694,7 @@ impl<R: Backend> Ufs<R> {
 				"blk_free: only whole-block frees are supported (size={size}, bsize={bsize})"
 			);
 
-			let cg = sb.blk_to_cg(bno);
-			(
-				sb.blk_to_cg(bno),
-				sb.blk_to_frag(sb.blk_to_cgoff(bno)),
-				sb.cg_addr(cg),
-			)
+			(sb.blk_to_cg(bno), sb.blk_to_frag(sb.blk_to_cgoff(bno)))
 		};
 		let mut cgd = self.read_cg(cg)?;
 		let mut map = self.read_blkmap(cg, &cgd)?;
@@ -672,8 +711,7 @@ impl<R: Backend> Ufs<R> {
 		}
 
 		map.set_free_block(off, true);
-		self.file
-			.write_at(cg_addr + cgd.freeoff as u64, map.as_bytes())?;
+		self.write_blkmap(cg, &cgd, &map)?;
 
 		cgd.cs.nbfree += 1;
 		self.write_cg(cg, &cgd)?;
@@ -700,8 +738,7 @@ impl<R: Backend> Ufs<R> {
 			return Ok(None);
 		};
 		map.set_used(off, true);
-		let addr = self.superblock.cg_addr(cg) + cgd.iusedoff as u64;
-		self.file.write_at(addr, map.as_bytes())?;
+		self.write_inomap(cg, &cgd, &map)?;
 		cgd.irotor = off as u32;
 		cgd.cs.nifree -= 1;
 		if (cgd.cs.ndir, cgd.cs.nbfree, cgd.cs.nifree, cgd.cs.nffree) == (-1, -1, -1, -1) {
@@ -767,7 +804,6 @@ impl<R: Backend> Ufs<R> {
 	pub(super) fn free_cg_inode(&mut self, inr: InodeNum) -> IoResult<()> {
 		self.assert_rw()?;
 		let (cg, off) = self.superblock.ino_in_cg(inr);
-		let addr = self.superblock.cg_addr(cg);
 		let mut cgd = self.read_cg(cg)?;
 		let mut map = self.read_inomap(cg, &cgd)?;
 
@@ -780,8 +816,7 @@ impl<R: Backend> Ufs<R> {
 		}
 
 		map.set_used(off, false);
-		self.file
-			.write_at(addr + cgd.iusedoff as u64, map.as_bytes())?;
+		self.write_inomap(cg, &cgd, &map)?;
 
 		cgd.cs.nifree += 1;
 		self.write_cg(cg, &cgd)?;

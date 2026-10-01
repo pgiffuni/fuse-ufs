@@ -375,6 +375,7 @@ impl BufferCache {
 		if !b.dirty {
 			b.dirty = true;
 			self.order.push_back(blk);
+			self.stats.dirty += 1;
 		}
 		Ok(b)
 	}
@@ -424,6 +425,9 @@ impl BufferCache {
 		// dependency that blocks it resolves.  For the same reason it stays in
 		// the dirty order, so that `write_back_all` picks it up again when the
 		// last gate opens.
+		if b.dirty && !unsafe_ {
+			self.stats.dirty -= 1;
+		}
 		b.dirty = unsafe_;
 		b.safe = None;
 		if !unsafe_ {
@@ -474,6 +478,19 @@ impl BufferCache {
 	/// True if no buffer is waiting to be written.
 	pub fn is_clean(&self) -> bool {
 		!self.buffers.values().any(Buffer::needs_write)
+	}
+
+	/// How many buffers have unsaved changes.
+	///
+	/// Deliberately not the negation of [`Self::is_clean`]: a buffer whose
+	/// *safe* image has been written but which is still waiting on a
+	/// dependency is not clean — its live image differs from the device — yet
+	/// it does not need another write-back, so `write_back_all` correctly
+	/// leaves it alone.  The two questions are separate, and conflating them
+	/// is how a flush ends up either spinning forever or discarding the
+	/// changes it was supposed to persist.
+	pub fn dirty_count(&self) -> usize {
+		self.buffers.values().filter(|b| b.is_dirty()).count()
 	}
 
 	fn fetch(&mut self, dev: &mut dyn BlockDevice, blk: u64) -> IoResult<()> {
@@ -740,12 +757,42 @@ mod t {
 		c.get(&mut d, 0).unwrap();
 		c.get(&mut d, 1).unwrap();
 		c.get_mut(&mut d, 1).unwrap().data[0] = 1;
+		assert_eq!(c.dirty_count(), 1);
 		c.write_back_all(&mut d).unwrap();
 		let s = c.stats();
 		assert_eq!(s.resident, 2);
 		assert_eq!(s.reads, 2);
 		assert_eq!(s.writes, 1);
 		assert_eq!(s.dirty, 0);
+		assert_eq!(c.dirty_count(), 0);
+	}
+
+	/// A safe write-back leaves the buffer dirty — its live image still differs
+	/// from the device — but it must not be offered a write again until the
+	/// gate that blocked it opens.
+	#[test]
+	fn a_gated_buffer_stays_dirty_after_a_safe_write_back() {
+		let mut c = cache();
+		let mut d = dev();
+		c.get_mut(&mut d, 0).unwrap().mark_unsafe(0, 8);
+		assert_eq!(c.write_back(&mut d, 0).unwrap(), Written::Safe);
+		assert_eq!(c.dirty_count(), 1, "the live image is still unsaved");
+		assert_eq!(c.stats().dirty, 1);
+		assert!(
+			!c.peek(0).unwrap().needs_write(),
+			"but it does not need a write"
+		);
+		// `is_clean` asks "does anything need writing right now", not "is
+		// everything on the disk".  The honest answer is yes: the last half of
+		// the buffer must not be written again until the gate that held it
+		// back opens.
+		assert!(c.is_clean());
+
+		c.get_mut(&mut d, 0).unwrap().publish_all();
+		assert_eq!(c.write_back(&mut d, 0).unwrap(), Written::Full);
+		assert_eq!(c.dirty_count(), 0);
+		assert_eq!(c.stats().dirty, 0);
+		assert!(c.is_clean());
 	}
 
 	/// A realistic sequence: allocate a block (bitmap), initialise it

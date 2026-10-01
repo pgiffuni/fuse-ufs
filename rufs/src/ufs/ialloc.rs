@@ -22,8 +22,12 @@ impl<R: Backend> Ufs<R> {
 	fn inode_setup(&mut self, inr: InodeNum, ino: &mut Inode) -> IoResult<()> {
 		log::trace!("inode_setup({inr});");
 		let inp = self.superblock.ino_to_fso(inr);
-		let old_nlink: u16 = self.file.decode_at(inp + 2)?;
-		let old_gen: u32 = self.file.decode_at(inp + 80)?;
+		// Straight out of the cached inode block, at the two offsets the struct
+		// wants them: `di_nlink` at 0 and `di_gen` at 78.  Read raw rather than
+		// through a whole `Inode`, because this is an inode of unknown vintage
+		// whose layout may not match `struct ufs2_dinode`.
+		let old_nlink: u16 = self.metadata_read(inp + 2)?;
+		let old_gen: u32 = self.metadata_read(inp + 80)?;
 
 		if old_nlink != 0 {
 			log::error!("inode_setup({inr}): use after free");
@@ -37,7 +41,8 @@ impl<R: Backend> Ufs<R> {
 		ino.gen = old_gen + 1;
 		ino.nlink = 1;
 		self.write_inode(inr, ino)?;
-		self.file.seek(0)?;
+		// Read it back through the cache: the inode has to be visible to the
+		// running filesystem immediately, before anything has been persisted.
 		let _ = self.read_inode(inr)?;
 		Ok(())
 	}
@@ -116,6 +121,14 @@ impl<R: Backend> Ufs<R> {
 		Ok(inr)
 	}
 
+	/// Read a whole indirect block.
+	///
+	/// An indirect block is an unframed array of `ufs2_daddr_t`, so this pulls
+	/// its bytes out of the metadata cache and converts them one entry at a
+	/// time with the image's byte order.  Through the cache rather than the
+	/// decoder because Soft Updates may be holding a gated entry of this very
+	/// block back, and a caller asking where a file currently maps has to be
+	/// answered from the live image.
 	pub(super) fn read_pblock(&mut self, bno: u64, block: &mut [u64]) -> IoResult<()> {
 		let fs = self.superblock.fsize as u64;
 		let bs = self.superblock.bsize as usize;
@@ -123,13 +136,22 @@ impl<R: Backend> Ufs<R> {
 
 		assert_eq!(block.len(), pbp);
 
-		self.file.seek(bno * fs)?;
-		for i in block.iter_mut() {
-			*i = self.file.decode()?;
+		let raw = self.metadata_read_at(bno * fs, pbp * size_of::<UfsDaddr>())?;
+		let config = self.file.config();
+		for (n, slot) in block.iter_mut().enumerate() {
+			let at = n * size_of::<UfsDaddr>();
+			let mut bytes = [0u8; size_of::<UfsDaddr>()];
+			bytes.copy_from_slice(&raw[at..][..size_of::<UfsDaddr>()]);
+			*slot = config.u64_from_bytes(&bytes);
 		}
 		Ok(())
 	}
 
+	/// Stage a whole indirect block.
+	///
+	/// The counterpart of [`Self::read_pblock`], staging rather than writing for
+	/// the same reason: Soft Updates decides when this block's bytes may reach
+	/// the disk, entry by entry.
 	pub(super) fn write_pblock(&mut self, bno: u64, block: &[u64]) -> IoResult<()> {
 		let fs = self.superblock.fsize as u64;
 		let bs = self.superblock.bsize as usize;
@@ -137,27 +159,34 @@ impl<R: Backend> Ufs<R> {
 
 		assert_eq!(block.len(), pbp);
 
-		self.file.seek(bno * fs)?;
-		for i in block.iter() {
-			self.file.encode(i)?;
+		let config = self.file.config();
+		let mut raw = vec![0u8; pbp * size_of::<u64>()];
+		for (n, v) in block.iter().enumerate() {
+			let at = n * size_of::<u64>();
+			raw[at..][..size_of::<u64>()].copy_from_slice(&config.u64_to_bytes(*v));
 		}
-		Ok(())
+		self.metadata_write_at(bno * fs, &raw)
+	}
+
+	/// Byte offset of entry `idx` of the indirect block at `bno`.
+	fn indir_off(&self, bno: u64, idx: u64) -> u64 {
+		bno * self.superblock.fsize as u64 + idx * size_of::<UfsDaddr>() as u64
 	}
 
 	/// Read one entry of an indirect block.
 	fn indir_get(&mut self, bno: u64, idx: u64) -> IoResult<u64> {
-		let fs = self.superblock.fsize as u64;
-		self.file
-			.decode_at(bno * fs + idx * size_of::<UfsDaddr>() as u64)
+		self.metadata_read(self.indir_off(bno, idx))
 	}
 
-	/// Write one entry of an indirect block.
+	/// Stage one entry of an indirect block.
+	///
+	/// This is where a *single* indirect pointer becomes visible, and therefore
+	/// where it will eventually be gated on the block it names: Soft Updates may
+	/// not let the entry out until that block is safely allocated and
+	/// initialised.  For now it is an ordinary dirty-buffer write, which is why
+	/// the block stays visible to readers through the cache.
 	fn indir_set(&mut self, bno: u64, idx: u64, val: u64) -> IoResult<()> {
-		let fs = self.superblock.fsize as u64;
-		self.file.encode_at(
-			bno * fs + idx * size_of::<UfsDaddr>() as u64,
-			&(val as UfsDaddr),
-		)
+		self.metadata_write(self.indir_off(bno, idx), &(val as UfsDaddr))
 	}
 
 	fn inode_free_l1(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
@@ -288,7 +317,11 @@ impl<R: Backend> Ufs<R> {
 		self.write_inode(inr, &ino)?;
 
 		let off = self.superblock.ino_to_fso(inr);
-		self.file.fill_at(off, 0u8, UFS_INOSZ)?;
+		// Clearing an inode is metadata like any other write: through the cache,
+		// so it becomes a dirty buffer that Soft Updates can order behind the
+		// removal of the directory entries and the data pointers, instead of a
+		// device write that lands immediately.
+		self.metadata_fill_at(off, 0u8, UFS_INOSZ)?;
 
 		self.free_cg_inode(inr)?;
 		if is_dir {

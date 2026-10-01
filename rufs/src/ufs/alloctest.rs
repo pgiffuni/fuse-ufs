@@ -501,6 +501,9 @@ fn bitmap_is_persistent_across_reopen() {
 		panic!("no blocks");
 	};
 	let first = b.direct[0] as u64;
+	// Cylinder-group structs are dirty metadata buffers now, not immediate
+	// writes, so they only survive a remount if they have been flushed.
+	ug.sync_metadata().unwrap();
 	drop(ug);
 
 	let mut ug = Ufs::open(img.path(), true).unwrap();
