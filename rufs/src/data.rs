@@ -489,31 +489,8 @@ impl Superblock {
 			})
 	}
 
-	/// inode number to cylinder group number.
-	pub fn ino_to_cg(&self, inr: InodeNum) -> u64 {
-		inr.get64() / self.ipg as u64
-	}
-
-	/// inode number to cylinder group number and offset.
-	pub fn ino_in_cg(&self, inr: InodeNum) -> (u64, u64) {
-		let ipg = self.ipg as u64;
-		let inr = inr.get64();
-		(inr / ipg, inr % ipg)
-	}
-
 	pub fn blocks_to_frags(&self, blocks: u64) -> u64 {
 		blocks << self.fragshift as u32
-	}
-
-	pub fn ino_to_fso(&self, inr: InodeNum) -> u64 {
-		let ipg = self.ipg as u64;
-		let fpg = self.fpg as u64;
-		let fs = self.fsize as u64;
-		let cgi = inr.get64() / ipg;
-		let off = inr.get64() % ipg;
-		let cgstart = cgi * fpg * fs;
-		let cgistart = cgstart + (self.iblkno as u64 * fs);
-		cgistart + (off * UFS_INOSZ as u64)
 	}
 }
 

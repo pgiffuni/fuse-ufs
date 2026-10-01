@@ -19,6 +19,7 @@ use crate::{
 	blockreader::{Backend, BlockReader},
 	data::*,
 	decoder::{Config, Decoder},
+	CgNum,
 };
 
 /// (INTERNAL) Constructs an [`std::io::Error`] from an `errno`.
@@ -185,7 +186,7 @@ impl<R: Backend> Ufs<R> {
 
 		// check that all cylgroups are ok.
 		for i in 0..self.superblock.ncg {
-			let addr = self.cg_addr(i as u64);
+			let addr = self.cg_addr(CgNum::new(i));
 			let cg: CylGroup = self.file.decode_at(addr).unwrap();
 			if cg.magic != CG_MAGIC {
 				log::error!("CG{i} has invalid cg magic: {:x}", cg.magic);
@@ -196,13 +197,8 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
-	fn cg_addr(&self, idx: u64) -> u64 {
-		let sb = &self.superblock;
-		let fpg = sb.fpg as u64;
-		let cblkno = sb.cblkno as u64;
-		let fs = sb.fsize as u64;
-
-		(idx * fpg + cblkno) * fs
+	fn cg_addr(&self, cg: CgNum) -> u64 {
+		self.superblock.cg_addr(cg)
 	}
 
 	fn update_sb(&mut self, f: impl FnOnce(&mut Superblock)) -> IoResult<()> {

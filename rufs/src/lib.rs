@@ -3,6 +3,7 @@
 mod blockreader;
 mod data;
 mod decoder;
+mod geom;
 mod inode;
 mod ufs;
 
@@ -14,5 +15,6 @@ pub const ENOATTR: i32 = libc::ENODATA;
 pub use crate::{
 	blockreader::{Backend, BlockReader},
 	data::{InodeAttr, InodeNum, InodeType},
+	geom::{AllocationSummary, CgNum},
 	ufs::{Info, Ufs},
 };

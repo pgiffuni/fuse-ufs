@@ -124,7 +124,7 @@ impl<R: Backend> Ufs<R> {
 		assert!(size.is_multiple_of(fsize));
 		assert!(bno % bsize / fsize + nfrag <= sb.frag as u64);
 
-		let cgi = bno / fpg;
+		let cgi = CgNum::new((bno / fpg) as u32);
 		let cgo = self.cg_addr(cgi);
 		let mut cg: CylGroup = self.file.decode_at(cgo)?;
 
@@ -175,8 +175,8 @@ impl<R: Backend> Ufs<R> {
 		let frag = sb.frag as u64;
 		let fpg = sb.fpg as u64;
 
-		for i in 0..(sb.ncg as u64) {
-			let cgo = self.cg_addr(i);
+		for i in 0..sb.ncg {
+			let cgo = self.cg_addr(CgNum::new(i));
 			let mut cg: CylGroup = self.file.decode_at(cgo)?;
 			if cg.cs.nbfree <= 0 {
 				continue;
@@ -193,7 +193,7 @@ impl<R: Backend> Ufs<R> {
 				cg.cs.nbfree -= 1;
 				self.file.encode_at(cgo, &cg)?;
 				self.update_sb(|sb| sb.cstotal.nbfree -= 1)?;
-				let blkno = NonZeroU64::new(i * fpg + bno).unwrap();
+				let blkno = NonZeroU64::new(i as u64 * fpg + bno).unwrap();
 				log::trace!("blk_alloc_full(): {blkno}");
 				return Ok(blkno);
 			}
