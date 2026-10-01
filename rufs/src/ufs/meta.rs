@@ -98,7 +98,10 @@
 use bincode_next::{Decode, Encode};
 
 use super::*;
-use crate::buf::Buffer;
+use crate::{
+	buf::{Buffer, Written},
+	softdep::DepId,
+};
 
 /// A metadata structure that does not fit in the filesystem block it starts in.
 ///
@@ -119,6 +122,15 @@ fn straddles(what: &str, at: u64, len: usize, bsize: u64) -> IoResult<()> {
 }
 
 impl<R: Backend> Ufs<R> {
+	/// The [`crate::buf::BufferCache`] block holding the UFS block `blk`.
+	///
+	/// See the module documentation on units.  Concretely, a UFS block `blk` is
+	/// at image byte offset `blk * fs_fsize`, and `BufferCache` addresses
+	/// `fs_bsize`-byte units, so the conversion is a division by `fs_frag`.
+	pub(super) fn metadata_blk(&self, blk: u64) -> u64 {
+		blk / self.superblock.frag()
+	}
+
 	/// Read-only view of the cached metadata block `blk`.
 	///
 	/// `blk` is a [`crate::buf::BufferCache`] block number, i.e. a `fs_bsize`
@@ -245,15 +257,30 @@ impl<R: Backend> Ufs<R> {
 
 	/// The metadata buffer cache.
 	///
-	/// Exposed for tests and for the eventual `tunefs`-style reporting; the
-	/// filesystem itself must go through the helpers above.
-	#[allow(dead_code)]
+	/// Test-only, deliberately.  The FUSE backend must not be able to reach in
+	/// here: deciding what gets persisted is `Ufs`'s job, and an accessor that
+	/// a callback could use to force a write would quietly undo the whole
+	/// architecture.
+	#[cfg(test)]
 	pub(super) fn metadata_cache(&self) -> &BufferCache {
 		&self.buf
 	}
 
+	/// The buffer-cache block holding a cylinder group's struct and bitmaps.
+	///
+	/// This is the block whose write-back satisfies `note_bitmap_written` for
+	/// every allocation out of that cylinder group, so getting it wrong would
+	/// either stall every dependency or advance them early.
+	pub(super) fn cg_blk(&self, cg: CgNum) -> u64 {
+		self.metadata_blk(self.superblock.cg_struct(cg))
+	}
+
 	/// The Soft Updates dependency graph.
-	#[allow(dead_code)]
+	///
+	/// Test-only, for the same reason as [`Self::metadata_cache`]: ordering is
+	/// decided here and nowhere else, so a caller that could inspect or advance
+	/// the graph would be able to publish a range nothing has justified.
+	#[cfg(test)]
 	pub(super) fn dependencies(&self) -> &DependencyEngine {
 		&self.softdep
 	}
@@ -275,7 +302,9 @@ impl<R: Backend> Ufs<R> {
 	///    keeps reading as "needs no write", because its safe image has already
 	///    been persisted and only its gated ranges changed;
 	/// 2. [`DependencyEngine::write_ready`] writes every buffer that has
-	///    nothing left to wait for.
+	///    nothing left to wait for;
+	/// 3. each completed write discharges whatever allocation events it made
+	///    true, which can open further gates -- hence the loop.
 	///
 	/// A buffer with an unresolved gate is *left resident and dirty*: it is not
 	/// written, and it is not discarded.  That is what "not safe yet" means.
@@ -289,7 +318,7 @@ impl<R: Backend> Ufs<R> {
 	/// filesystem, and reaching that from every operation is what the
 	/// dependency wiring is for.
 	pub fn sync_metadata(&mut self) -> IoResult<()> {
-		if self.buf.dirty_count() == 0 {
+		if self.buf.dirty_count() == 0 && self.softdep.is_empty() {
 			return Ok(());
 		}
 		// A dirty buffer on a read-only mount would reach `BlockReader::write`,
@@ -298,11 +327,66 @@ impl<R: Backend> Ufs<R> {
 		// is better than panicking inside the decoder adapter.
 		self.assert_rw()?;
 
-		self.softdep.publish_into(&mut self.buf);
-		let written = self.softdep.write_ready(&mut self.buf, &mut self.file)?;
-		log::trace!("sync_metadata(): wrote {} buffer(s)", written.len());
-		for (blk, how) in written {
-			log::trace!("sync_metadata(): block {blk}: {how:?}");
+		// Drain: publishing and writing each open gates, so one pass is not
+		// enough.  A pass writes the cylinder group, which discharges the
+		// allocation, which publishes the inode's pointer range, which is only
+		// written by the *next* pass.  Each pass either writes at least one
+		// buffer or stops, and a written buffer is clean afterwards, so this
+		// terminates -- the loop is bounded by the number of dirty buffers.
+		let mut total = 0;
+		loop {
+			self.softdep.publish_into(&mut self.buf);
+			let written = self.softdep.write_ready(&mut self.buf, &mut self.file)?;
+			for (blk, how) in &written {
+				self.note_block_written(*blk, *how)?;
+			}
+			if written.is_empty() {
+				break;
+			}
+			total += written.len();
+		}
+		log::trace!("sync_metadata(): wrote {total} buffer(s)");
+		Ok(())
+	}
+
+	/// Turn a completed write-back into the allocation events it made true.
+	///
+	/// This is the only place the filesystem learns that bytes reached the
+	/// device, and it is deliberately downstream of the write: `BufferCache`
+	/// reports what it actually did, and a dependency may only be advanced by
+	/// that report.  Anything that notified the engine from the *modification*
+	/// side -- "the bitmap bit was cleared", "the block was filled" -- would be
+	/// claiming the disk has the change when it does not, and every gate on it
+	/// would open early.
+	///
+	/// The two events are not symmetric, and the difference is the whole point
+	/// of keeping them apart:
+	///
+	/// * a cylinder group's bitmap is **never** gated, so *either* kind of write
+	///   persists it -- the safe image is byte-for-byte the live image there,
+	///   and a full write is a superset of a safe one;
+	/// * a block's *contents* are the live image, so only a **full** write
+	///   persisted them.  A safe write sent everything except the gated ranges,
+	///   which is not the same thing at all.
+	fn note_block_written(&mut self, blk: u64, how: Written) -> IoResult<()> {
+		let full = how == Written::Full;
+		let mut bitmap: Vec<DepId> = Vec::new();
+		let mut contents: Vec<DepId> = Vec::new();
+		for dep in self.softdep.new_blocks() {
+			if self.cg_blk(dep.cg()) == blk {
+				bitmap.push(dep.id());
+			}
+			if full && self.metadata_blk(dep.blk()) == blk {
+				contents.push(dep.id());
+			}
+		}
+		for id in bitmap {
+			log::trace!("note_block_written({blk}): bitmap for {id:?}");
+			self.softdep.note_bitmap_written(id)?;
+		}
+		for id in contents {
+			log::trace!("note_block_written({blk}): contents for {id:?}");
+			self.softdep.note_contents_written(id)?;
 		}
 		Ok(())
 	}

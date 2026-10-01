@@ -84,6 +84,7 @@ use crate::{
 	err,
 	geom::CgNum,
 	policy::{pref_block, BlockPref, BlockPrefInput, BlockRole},
+	softdep::DepId,
 };
 
 /// Number of bits in a map byte.
@@ -628,9 +629,60 @@ impl<R: Backend> Ufs<R> {
 		self.assert_rw()?;
 		let pref = self.block_pref(role, inr, lbn, prev, last_direct, first_indirect);
 		match self.hash_alloc_block(pref)? {
-			Some(b) => Ok(b),
+			Some(b) => {
+				// The allocation exists in the in-memory bitmap and in the cached
+				// cylinder-group struct, and nowhere else.  Registering the
+				// dependency here -- at the one place every allocation goes
+				// through -- is what makes "a pointer to this block may not be
+				// trusted yet" expressible at all.
+				self.register_new_block(b.get());
+				Ok(b)
+			}
 			None => Err(err!(ENOSPC)),
 		}
+	}
+
+	/// Register a newly allocated block with the dependency engine.
+	///
+	/// Created by [`Self::blk_alloc_for`], the only path by which a block
+	/// becomes allocated.  The dependency says two things about the block:
+	/// its allocation bitmap must reach the disk, and its initialised contents
+	/// must reach the disk, before any pointer to it may become persistent.
+	///
+	/// Note what is *not* claimed here: that either of them has happened.  The
+	/// bitmap bit has been set in memory and the block has not been written;
+	/// the two facts are recorded when the corresponding bytes actually reach
+	/// the device, and until then nothing may point at this block.
+	///
+	/// Protects invariants 2, 3 and 4 in `docs/ufs2-invariants.md`.
+	pub(super) fn register_new_block(&mut self, blk: u64) -> DepId {
+		let cg = self.superblock.blk_to_cg(blk);
+		let id = self.softdep.new_block(blk, cg);
+		log::trace!("register_new_block({blk}) in {cg}: {id:?}");
+		id
+	}
+
+	/// The allocation dependency for `blk`, if it is still outstanding.
+	pub(super) fn allocation_of(&self, blk: u64) -> Option<DepId> {
+		self.softdep.dep_for_block(blk)
+	}
+
+	/// Record that the initialised contents of `blk` have reached the device.
+	///
+	/// Distinct from having *changed* the block.  A live image that has been
+	/// modified is still a lie as far as the disk is concerned, and treating
+	/// the two as the same is precisely the bug that makes an uninitialised
+	/// block reachable through a persistent pointer.
+	///
+	/// A block with no outstanding dependency is silently not noted: it was
+	/// already allocated before this operation, so its contents being on the
+	/// disk says nothing about anything pending.
+	pub(super) fn note_block_contents(&mut self, blk: u64) -> IoResult<()> {
+		if let Some(id) = self.allocation_of(blk) {
+			log::trace!("note_block_contents({blk}): {id:?}");
+			self.softdep.note_contents_written(id)?;
+		}
+		Ok(())
 	}
 
 	/// Allocate one filesystem block and zero it.

@@ -1,7 +1,12 @@
 use std::mem::replace;
 
 use super::*;
-use crate::{err, policy::BlockRole, InodeNum};
+use crate::{
+	err,
+	policy::BlockRole,
+	softdep::{DepKind, Gate},
+	InodeNum,
+};
 
 const STAT_BLKSIZE: u64 = 512;
 
@@ -169,7 +174,7 @@ impl<R: Backend> Ufs<R> {
 	}
 
 	/// Byte offset of entry `idx` of the indirect block at `bno`.
-	fn indir_off(&self, bno: u64, idx: u64) -> u64 {
+	pub(super) fn indir_off(&self, bno: u64, idx: u64) -> u64 {
 		bno * self.superblock.fsize as u64 + idx * size_of::<UfsDaddr>() as u64
 	}
 
@@ -187,6 +192,67 @@ impl<R: Backend> Ufs<R> {
 	/// the block stays visible to readers through the cache.
 	fn indir_set(&mut self, bno: u64, idx: u64, val: u64) -> IoResult<()> {
 		self.metadata_write(self.indir_off(bno, idx), &(val as UfsDaddr))
+	}
+
+	/// Stage one entry of an indirect block and gate it on the allocation of the
+	/// block it names.
+	///
+	/// This is the middle link of the chain a large file builds:
+	///
+	/// ```text
+	///   data block
+	///        |
+	///        v
+	///   indirect entry     <- gated here, on the data block's allocation
+	///        |
+	///        v
+	///   indirect block     <- itself gated on its allocation, by the caller
+	///        |
+	///        v
+	///   inode pointer      <- gated on the indirect block's allocation
+	/// ```
+	///
+	/// Each link is gated independently rather than the whole indirect block
+	/// being held back, and that is what the safe image is for.  An indirect
+	/// block with one new entry can persist as `[A B 0 D]`: the entries that
+	/// were already safe, the new one as a hole, the rest of the block's old
+	/// contents.  Blocking the whole block would also be wrong rather than
+	/// merely slow -- it would delay entries that have nothing to do with the
+	/// allocation in flight.
+	///
+	/// Only a *non-zero* entry is gated.  Writing zero is a removal, and there
+	/// is nothing there for a stale pointer to reach.
+	pub(super) fn indir_set_gated(&mut self, bno: u64, idx: u64, val: u64) -> IoResult<()> {
+		self.indir_set(bno, idx, val)?;
+		let Some(dep) = self.allocation_of(val) else {
+			return Ok(());
+		};
+		let (blk, off) = self.indir_range(bno, idx);
+		log::trace!("gating indirect entry {bno}:{idx} at {blk}:{off} on {dep:?}");
+		self.softdep.gate(
+			&mut self.buf,
+			DepKind::IndirectPointer,
+			blk,
+			off,
+			size_of::<UfsDaddr>() as u64,
+			Gate::AllocationSafe(dep),
+		)?;
+		Ok(())
+	}
+
+	/// The cache block and in-block byte offset of entry `idx` of the indirect
+	/// block at `bno`.
+	///
+	/// An indirect block is `fs_bsize` bytes of `ufs2_daddr_t`, addressed by a
+	/// UFS block -- that is, a *fragment* address -- so its entries live in one
+	/// cache block and the offset is just `entry * sizeof(ufs2_daddr_t)`.  The
+	/// block has to be `fs_bsize`-aligned for that to hold, which is the same
+	/// assumption `Ufs::read_pblock` makes when it refuses to read one that is
+	/// not.
+	pub(super) fn indir_range(&self, bno: u64, idx: u64) -> (u64, u64) {
+		let bs = self.superblock.bsize();
+		let at = bno * self.superblock.fsize();
+		(at / bs, at % bs + idx * size_of::<UfsDaddr>() as u64)
 	}
 
 	fn inode_free_l1(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
@@ -480,6 +546,67 @@ impl<R: Backend> Ufs<R> {
 	/// Any indirect block created here is allocated with
 	/// [`BlockRole::Indirect`], which is what places the *first* one right
 	/// after the last direct block and later ones in the metadata zone.
+	/// The byte range of the `i`-th direct block pointer within `inr`'s inode.
+	///
+	/// `(offset, length)`, relative to the start of the inode.
+	///
+	/// This is what a Soft Updates gate is expressed in: the range of bytes a
+	/// dependency may hold back.  It is derived from [`UFS_EXT_OFF`] rather than
+	/// written out here, so there is exactly one place in the crate that knows
+	/// where the pointers are, and `the_pointer_offsets_match_the_encoding` in
+	/// `rufs/src/ufs/mapping.rs` checks it against the real encoder.
+	pub(super) fn direct_pointer_range(&self, i: usize) -> (u64, u64) {
+		(
+			UFS_EXT_OFF as u64 + i as u64 * size_of::<UfsDaddr>() as u64,
+			size_of::<UfsDaddr>() as u64,
+		)
+	}
+
+	/// The byte range of the `i`-th indirect block pointer.
+	///
+	/// See [`Self::direct_pointer_range`].
+	pub(super) fn indirect_pointer_range(&self, i: usize) -> (u64, u64) {
+		(
+			UFS_EXTB_OFF as u64 + i as u64 * size_of::<UfsDaddr>() as u64,
+			size_of::<UfsDaddr>() as u64,
+		)
+	}
+
+	/// The byte range of the pointer at logical index `idx`, wherever it lives.
+	///
+	/// The logical index is `blkidx`, the same numbering
+	/// [`Ufs::inode_resolve_block`] takes: `0..UFS_NDADDR` are the direct
+	/// pointers and the rest index `di_extb`.  `None` for an index past the end,
+	/// which cannot happen for a block index that [`Ufs::decode_blkidx`]
+	/// accepted, and is not silently rounded into some neighbouring slot.
+	pub(super) fn pointer_range(&self, idx: u64) -> Option<(u64, u64)> {
+		if idx < UFS_NDADDR as u64 {
+			Some(self.direct_pointer_range(idx as usize))
+		} else if idx < (UFS_NDADDR + UFS_NIADDR) as u64 {
+			Some(self.indirect_pointer_range((idx - UFS_NDADDR as u64) as usize))
+		} else {
+			None
+		}
+	}
+
+	/// Where the pointer at logical index `idx` of `inr` lives, as
+	/// `(cache block, offset in that block, length)`.
+	///
+	/// This is the form a Soft Updates gate needs, and it is derived from the
+	/// inode's *byte address* rather than from `ino_to_fsba()` alone.  That
+	/// distinction is not cosmetic: `ino_to_fso()` is
+	/// `ino_to_fsba() * fs_fsize + ino_to_fsbo() * UFS_INOSZ`, because an inode
+	/// block holds `fs_inopb` inodes and each one starts `UFS_INOSZ` bytes in.
+	/// A gate computed from `ino_to_fsba()` alone marks the *first* inode's
+	/// pointer unsafe while writing a later inode's -- which corrupts an inode
+	/// nobody asked about and leaves the one actually being modified ungated.
+	pub(super) fn inode_pointer_range(&self, inr: InodeNum, idx: u64) -> Option<(u64, u64, u64)> {
+		let (off, len) = self.pointer_range(idx)?;
+		let sb = &self.superblock;
+		let at = sb.ino_to_fso(inr);
+		Some((at / sb.bsize(), off + at % sb.bsize(), len))
+	}
+
 	fn inode_set_block(
 		&mut self,
 		inr: InodeNum,
@@ -497,11 +624,18 @@ impl<R: Backend> Ufs<R> {
 		let last_direct = direct[UFS_NDADDR - 1] as u64;
 		let first_indirect = indirect[0] as u64;
 		let mut wb = false;
+		// Which slot of `di_ext` this call may have just filled, and with which
+		// block.  `None` until it actually writes one: an indirect *entry* lives
+		// in an indirect block, not in the inode, and the inode must not be
+		// written or gated for it.  Assigned in each arm that fills a slot.
+		#[allow(unused_assignments)]
+		let mut inode_pointer: Option<(usize, u64)> = None;
 
 		match self.decode_blkidx(blkidx)? {
 			InodeBlock::Direct(off) => {
 				direct[off] = block.get() as i64;
 				wb = true;
+				inode_pointer = Some((off, block.get()));
 			}
 			InodeBlock::Indirect1(off) => {
 				if indirect[0] == 0 {
@@ -517,8 +651,9 @@ impl<R: Backend> Ufs<R> {
 						.get() as i64;
 					wb = true;
 				}
+				inode_pointer = Some((UFS_NDADDR, indirect[0] as u64));
 
-				self.indir_set(indirect[0] as u64, off as u64, block.get())?;
+				self.indir_set_gated(indirect[0] as u64, off as u64, block.get())?;
 			}
 			InodeBlock::Indirect2(high, low) => {
 				if indirect[1] == 0 {
@@ -534,6 +669,7 @@ impl<R: Backend> Ufs<R> {
 						.get() as i64;
 					wb = true;
 				}
+				inode_pointer = Some((UFS_NDADDR + 1, indirect[1] as u64));
 
 				let x1 = indirect[1] as u64;
 				let x2 = self.indir_get(x1, high as u64)?;
@@ -551,7 +687,7 @@ impl<R: Backend> Ufs<R> {
 				} else {
 					x2
 				};
-				self.indir_set(x2, low as u64, block.get())?;
+				self.indir_set_gated(x2, low as u64, block.get())?;
 			}
 			InodeBlock::Indirect3(high, mid, low) => {
 				if indirect[2] == 0 {
@@ -567,6 +703,7 @@ impl<R: Backend> Ufs<R> {
 						.get() as i64;
 					wb = true;
 				}
+				inode_pointer = Some((UFS_NDADDR + 2, indirect[2] as u64));
 
 				let x1 = indirect[2] as u64;
 				let x2 = self.indir_get(x1, high as u64)?;
@@ -599,7 +736,7 @@ impl<R: Backend> Ufs<R> {
 				} else {
 					x3
 				};
-				self.indir_set(x3, low as u64, block.get())?;
+				self.indir_set_gated(x3, low as u64, block.get())?;
 			}
 		}
 
@@ -607,6 +744,55 @@ impl<R: Backend> Ufs<R> {
 			self.write_inode(inr, ino)?;
 		}
 
+		// Only *now* is the pointer in the inode's live image, and only now can
+		// the range that holds it be gated.  Doing it in the other order would
+		// either miss the write or gate bytes that do not hold a pointer yet.
+		//
+		// `Gate::AllocationSafe`, not `AllocationAllocated` or
+		// `AllocationInitialised`: a pointer to a block whose bitmap bit has
+		// landed but whose contents have not is exactly the failure this
+		// dependency exists to prevent, and the other two gates would let it
+		// through.
+		if let Some((slot, blk)) = inode_pointer {
+			self.gate_inode_pointer(inr, slot, blk)?;
+		}
+
+		Ok(())
+	}
+
+	/// Gate the slot of `di_ext` that was just filled with `blk`.
+	///
+	/// The inode pointer at logical index `idx` is `di_ext[idx]` when
+	/// `idx < UFS_NDADDR` and `di_extb[idx - UFS_NDADDR]` above it; both are
+	/// `Ufs::pointer_range`'s business, and this only decides which dependency
+	/// kind the gate is filed under.
+	fn gate_inode_pointer(&mut self, inr: InodeNum, idx: usize, blk: u64) -> IoResult<()> {
+		let Some(dep) = self.allocation_of(blk) else {
+			return Ok(());
+		};
+		let idx = idx as u64;
+		let (range_blk, off, len) = self
+			.inode_pointer_range(inr, idx)
+			.ok_or_else(|| err!(EIO))?;
+		let kind = if idx < UFS_NDADDR as u64 {
+			DepKind::DirectPointer
+		} else {
+			// The pointer names an indirect block, not a data block, so it is
+			// an indirect pointer even though it lives in the inode.  Collapsing
+			// the two would make the documentation of `DepKind::IndirectPointer`
+			// -- which promises that an indirect block is not published before
+			// every entry it gained is safe -- untrue.
+			DepKind::IndirectPointer
+		};
+		log::trace!("gating {inr}'s di_ext[{idx}] at {range_blk}:{off}+{len} on {dep:?}");
+		self.softdep.gate(
+			&mut self.buf,
+			kind,
+			range_blk,
+			off,
+			len,
+			Gate::AllocationSafe(dep),
+		)?;
 		Ok(())
 	}
 

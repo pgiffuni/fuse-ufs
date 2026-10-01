@@ -137,9 +137,50 @@ Implemented:
   `Gate::InodeReclaimed` exist and are honoured by `signal()`, but no operation
   raises them yet.
 
-**Status: implemented and tested (10 tests).  The engine is not yet in the write
-path**: the allocator and the inode and directory code still write through
-`BlockReader`.
+**Status: implemented and tested (10 engine tests), and now in the write path.**
+See below for what is wired to it and what is not.
+
+## 3.3 What is wired to the engine
+
+`Ufs` owns a `buf::BufferCache` and a `softdep::DependencyEngine`
+(`rufs/src/ufs/meta.rs`), and `Ufs::sync_metadata()` is the only thing that
+persists metadata.  What reaches it today:
+
+| operation | behaviour |
+|---|---|
+| cylinder-group structs | staged, dirty until flushed |
+| `cg_blksfree[]`, `cg_iused[]` | staged, and the *same buffer* as the struct |
+| inodes | staged; a staged inode is visible to the running filesystem immediately |
+| indirect blocks | staged; a newly allocated one is zeroed through the cache |
+| a new direct pointer | gated on `Gate::AllocationSafe` of the block it names |
+| a new indirect-block entry | gated on `Gate::AllocationSafe` of the block it names |
+| the inode pointer to a new indirect block | gated, as `DepKind::IndirectPointer` |
+
+`sync_metadata()` drains: it publishes, writes, discharges whatever allocation
+events each completed write made true, and repeats until a pass writes nothing.
+One pass is not enough -- the pass that writes the cylinder group discharges the
+allocation, which opens the inode's pointer range, and only the next pass writes
+it.
+
+The distinction the whole design rests on is between *changing* a block and *the
+block having reached the device*.  Only `BufferCache`'s write-back report may
+advance a dependency, and the two events are deliberately asymmetric: a
+cylinder group's bitmap is never gated, so any write persists it, while a block's
+*contents* are the live image, so only a `Written::Full` write persisted them.
+
+### Still direct
+
+| path | why |
+|---|---|
+| ordinary file data | the kernel page cache is buffering it; a second layer would make every writeback an ordering question |
+| **directory blocks** | `dir_newlink()` and `readdir` use `inode_read`/`inode_write`.  This is what blocks `DirectoryAdd` |
+| the superblock | `update_sb()` writes it directly, and nothing gates it |
+| extended attributes | stored outside the block map |
+
+Directory blocks are the notable one.  `DepKind::DirectoryAdd` cannot be raised
+until a directory block is a cached buffer, because `DependencyEngine::gate()`
+requires its block to be resident and would otherwise have nothing to mark
+unsafe.  Routing them through the cache is the next step.
 
 ## 4. What is not implemented
 
@@ -308,12 +349,13 @@ everything, ungated.  That is the same behaviour as before, minus the immediacy.
 
 What is left, in order, each independently verifiable:
 
-1. Raise `NewBlockDep` from `blk_alloc_for` and `DirectPointerDep` from
-   `inode_set_block`; write through the engine.  Verifiable by
-   `crash_at_each_intermediate_point` end-to-end with the crash harness.
-2. Directory blocks through the cache.  `dir_newlink` writes a data block
+1. ~~Raise `NewBlockDep` from `blk_alloc_for` and the direct-pointer gate from
+   `inode_set_block`; write through the engine.~~  **Done.**
+2. Directory blocks through the cache.  `dir_newlink` writes a directory block
    through `inode_write_block`, so a directory entry is currently *not* covered
-   by the cache at all -- which is why `DirectoryAddDep` is not in the list below.
+   by the cache at all.  This is what blocks `DirectoryAdd`, and it has to come
+   first: two writers to one block is the same bug the cylinder-group bitmaps
+   already had.
 3. `InodeUpdateDep` and `DirectoryAddDep` in `dir_newlink`/`mknod`.
 4. `DirectoryRemoveDep` in `dir_try_unlink`/`rmdir` — the first operation whose
    *removal* ordering matters.

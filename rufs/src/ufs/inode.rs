@@ -246,6 +246,13 @@ impl<R: Backend> Ufs<R> {
 		};
 
 		self.file.write_at(blkno.get() * fs, &buf[0..size])?;
+
+		// `buf[0..size]` is the whole allocated region for this logical block --
+		// `inode_write()` always assembles it -- so the block's initialised
+		// contents have now reached the device, and any dependency waiting on
+		// that fact may advance.  Noting it here rather than at allocation time
+		// is the point: the allocation only *reserved* the block.
+		self.note_block_contents(blkno.get())?;
 		Ok(())
 	}
 

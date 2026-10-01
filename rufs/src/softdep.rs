@@ -313,6 +313,11 @@ pub struct NewBlockDep {
 }
 
 impl NewBlockDep {
+	/// This dependency's identifier.
+	pub fn id(&self) -> DepId {
+		self.id
+	}
+
 	/// The block this dependency is about.
 	pub fn blk(&self) -> u64 {
 		self.blk
@@ -359,6 +364,21 @@ impl NewBlockDep {
 pub struct DependencyEngine {
 	next:       u64,
 	new_blocks: BTreeMap<DepId, NewBlockDep>,
+
+	/// `NewBlockDep`s indexed by the block they are about.
+	///
+	/// A pointer path that has just allocated a block needs to know which
+	/// allocation to gate on, and it has a block number, not a [`DepId`].
+	/// Threading a `DepId` out of `Ufs::blk_alloc_for()` and back down into
+	/// `Ufs::inode_set_block()` would put a dependency identifier into every
+	/// allocator signature for the sake of one caller; the index answers the
+	/// same question without that.
+	///
+	/// A block that is freed and reallocated within one operation gets a second
+	/// entry, overwriting the first, which is the one that matters: the old
+	/// allocation is no longer the reason any pointer is being held back.
+	by_block: BTreeMap<u64, DepId>,
+
 	deps:       BTreeMap<DepId, Dependency>,
 	/// Gates keyed by what they wait for, so completing an allocation does not
 	/// have to scan every dependency.
@@ -396,12 +416,30 @@ impl DependencyEngine {
 				complete: false,
 			},
 		);
+		self.by_block.insert(blk, id);
 		id
 	}
 
 	/// Look up a new-block dependency.
 	pub fn new_block_dep(&self, id: DepId) -> Option<&NewBlockDep> {
 		self.new_blocks.get(&id)
+	}
+
+	/// The dependency a block is waiting on, if it has one.
+	///
+	/// `None` once the allocation is complete, so a caller must treat "no
+	/// dependency" and "already resolved" as the same answer, which they are:
+	/// either way there is nothing left to wait for.
+	pub fn dep_for_block(&self, blk: u64) -> Option<DepId> {
+		self.by_block.get(&blk).copied()
+	}
+
+	/// Every outstanding new-block allocation.
+	///
+	/// The flush loop walks this after each write-back to decide which
+	/// allocation events a completed write made true.
+	pub fn new_blocks(&self) -> impl Iterator<Item = &NewBlockDep> {
+		self.new_blocks.values()
 	}
 
 	/// The allocation state of a new-block dependency.
@@ -434,7 +472,15 @@ impl DependencyEngine {
 			.ok_or_else(|| invalid_dep(id))?;
 		f(dep);
 		let safe = dep.allows_publication();
+		let (blk, done) = (dep.blk, dep.complete);
 		self.settle(&id);
+		if done {
+			// Nothing can be waiting on a finished allocation, so there is
+			// nothing to keep.  Dropping it here is what stops `dep_for_block`
+			// from reporting a resolved dependency as outstanding.
+			self.by_block.remove(&blk);
+			self.new_blocks.remove(&id);
+		}
 		Ok(safe)
 	}
 
@@ -519,6 +565,16 @@ impl DependencyEngine {
 	/// Look up a dependency.
 	pub fn dep(&self, id: DepId) -> Option<&Dependency> {
 		self.deps.get(&id)
+	}
+
+	/// Every outstanding dependency.
+	///
+	/// Test-only, like the accessors on `Ufs`: the graph is the scheduler's
+	/// business, and a caller that could enumerate it could also reason about
+	/// gates it has no business touching.
+	#[cfg(test)]
+	pub fn all(&self) -> impl Iterator<Item = &Dependency> {
+		self.deps.values()
 	}
 
 	/// Whether a dependency has been published.
