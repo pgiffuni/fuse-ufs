@@ -7,6 +7,7 @@ mod decoder;
 mod geom;
 mod inode;
 mod policy;
+mod softdep;
 #[cfg(test)]
 mod testutil;
 mod ufs;
@@ -21,5 +22,6 @@ pub use crate::{
 	buf::{BlockDevice, Buffer, BufferCache},
 	data::{InodeAttr, InodeNum, InodeType},
 	geom::{AllocationSummary, CgNum},
+	softdep::{DepId, DepKind, DependencyEngine, Gate},
 	ufs::{fsck::Report, Info, Ufs},
 };

@@ -166,6 +166,11 @@ impl Buffer {
 		&self.data
 	}
 
+	/// The live contents, for modification.
+	pub fn data_mut(&mut self) -> &mut [u8] {
+		&mut self.data
+	}
+
 	/// Whether the live contents differ from the device.
 	pub fn is_dirty(&self) -> bool {
 		self.dirty
@@ -416,15 +421,22 @@ impl BufferCache {
 		b.safe_written = unsafe_;
 		// A safe write-back does *not* clean the buffer: the live image still
 		// differs from the device, and it must be written once the
-		// dependency that blocks it resolves.
+		// dependency that blocks it resolves.  For the same reason it stays in
+		// the dirty order, so that `write_back_all` picks it up again when the
+		// last gate opens.
 		b.dirty = unsafe_;
 		b.safe = None;
-		self.order.retain(|&x| x != blk);
+		if !unsafe_ {
+			self.order.retain(|&x| x != blk);
+		}
 		Ok(written)
 	}
 
 	/// Write every dirty buffer back, oldest first.
 	pub fn write_back_all(&mut self, dev: &mut dyn BlockDevice) -> IoResult<Vec<(u64, Written)>> {
+		// `order` may still contain blocks whose gates have not opened; those
+		// are filtered out by `write_back` itself, which returns `Clean` for
+		// anything that does not need a write.
 		let order: Vec<u64> = self.order.iter().copied().collect();
 		let mut out = Vec::with_capacity(order.len());
 		for blk in order {
