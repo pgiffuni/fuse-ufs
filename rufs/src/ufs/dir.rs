@@ -3,6 +3,16 @@ use std::io::{BufRead, Write};
 use super::*;
 use crate::{err, InodeNum};
 
+/// The size of `direntry::di_ino`, the inode number a directory entry names.
+///
+/// `direntry` is `{ u_int32_t di_ino; u_int16_t di_reclen; u_int8_t di_type;
+/// u_int8_t di_namlen; char di_name[]; }`, so the number is 4 bytes even though
+/// UFS block addresses are `ufs2_daddr_t` and therefore 8.  Gating eight bytes
+/// here would also zero `di_reclen`, and the rest of the record would then be
+/// unparseable -- a crash would turn a half-written entry into a directory that
+/// `fsck` cannot walk past.
+const DIRENT_INR_LEN: u64 = 4;
+
 #[derive(Debug, Clone, Copy)]
 struct Header {
 	inr:     InodeNum,
@@ -140,7 +150,14 @@ fn readdir_block<T>(
 	Ok(None)
 }
 
-fn newlink_block(block: &mut [u8], mut entry: Header, config: Config) -> IoResult<bool> {
+/// Where `newlink_block` put a new entry.
+///
+/// The offset is needed because a Soft Updates gate is a byte range, and the
+/// range that matters is the entry's inode number -- four bytes -- rather than
+/// the whole entry.  Gating the name and the type would delay them for no
+/// reason; gating nothing would let the entry persist before the inode it
+/// names.
+fn newlink_block(block: &mut [u8], mut entry: Header, config: Config) -> IoResult<Option<u64>> {
 	let mut file = Decoder::new(Cursor::new(block), config);
 
 	loop {
@@ -160,10 +177,10 @@ fn newlink_block(block: &mut [u8], mut entry: Header, config: Config) -> IoResul
 		file.seek(pos)?;
 		hdr.write(&mut file)?;
 		entry.write(&mut file)?;
-		return Ok(true);
+		return Ok(Some(pos));
 	}
 
-	Ok(false)
+	Ok(None)
 }
 
 fn unlink_block(
@@ -331,8 +348,9 @@ impl<R: Backend> Ufs<R> {
 			let n = self.inode_read(dinr, pos, &mut block)?;
 			assert_eq!(n, DIRBLKSIZE);
 
-			if newlink_block(&mut block, entry, self.file.config())? {
+			if let Some(at) = newlink_block(&mut block, entry, self.file.config())? {
 				self.inode_write(dinr, pos, &block)?;
+				self.gate_dirent(dinr, pos, at, inr)?;
 				return Ok(());
 			}
 
@@ -347,7 +365,80 @@ impl<R: Backend> Ufs<R> {
 			self.file.config(),
 		))?;
 		self.inode_write(dinr, pos, &block)?;
+		// A fresh block starts with the entry at offset zero.
+		self.gate_dirent(dinr, pos, 0, inr)?;
 		Ok(())
+	}
+
+	/// Hold back the inode number of a directory entry until `inr` is on the
+	/// disk.
+	///
+	/// Created by [`Self::dir_newlink`].  Protects invariants 5 and 6 in
+	/// `docs/ufs2-invariants.md`.
+	///
+	/// # The ordering
+	///
+	/// A directory entry must not reach the disk before the inode it names is
+	/// there.  The reverse order -- inode first, then the entry -- is fine: a
+	/// directory entry that has not been created yet costs an allocated inode
+	/// that nothing points at, which `fsck` pass 2 reclaims harmlessly.  The
+	/// other order is the disaster: a crash leaves a directory entry naming an
+	/// inode whose bitmap bit is clear and whose contents are zeroes, so the file
+	/// appears to exist, reads back as empty, and `fsck` pass 2 removes the
+	/// entry -- discarding a directory whose data was never lost, only
+	/// unreachable.
+	///
+	/// # Why four bytes
+	///
+	/// Only `direntry::inr` is gated, not the name or the type.  The name and
+	/// the type are consequences of the inode, not references to it, and
+	/// holding them back would delay a lookup finding a file that is already
+	/// perfectly readable.  The whole entry is not gated for the same reason:
+	/// the block it lives in usually holds other entries that have nothing to
+	/// do with this allocation, and the safe image exists precisely so that
+	/// they need not be delayed.
+	///
+	/// # What resolves it
+	///
+	/// The inode's own write reaching the device.  There is no "inode safe"
+	/// event to reuse -- an inode's block map is a pointer, and *that* is gated
+	/// on the blocks it names -- so the event is signalled from
+	/// `sync_metadata()` once the inode's block has actually been written.
+	fn gate_dirent(
+		&mut self,
+		dinr: InodeNum,
+		file_pos: u64,
+		block_off: u64,
+		inr: InodeNum,
+	) -> IoResult<()> {
+		let Some(blk) = self.dirent_block(dinr, file_pos)? else {
+			// The block was freed underneath us; there is nothing to gate and
+			// nothing that can reach the entry.
+			return Ok(());
+		};
+		let off = block_off;
+		log::trace!("gating {dinr}'s entry for {inr} at {blk}:{off}+{DIRENT_INR_LEN}");
+		self.softdep.gate(
+			&mut self.buf,
+			crate::softdep::DepKind::DirectoryAdd,
+			blk,
+			off,
+			DIRENT_INR_LEN,
+			crate::softdep::Gate::InodeWritten(inr),
+		)?;
+		Ok(())
+	}
+
+	/// The cache block holding the directory block at file offset `pos` of
+	/// `dinr`.
+	fn dirent_block(&mut self, dinr: InodeNum, pos: u64) -> IoResult<Option<u64>> {
+		let ino = self.read_inode(dinr)?;
+		let Some(info) = self.inode_locate(dinr, &ino, pos) else {
+			return Ok(None);
+		};
+		Ok(self
+			.inode_resolve_block(dinr, &ino, info.blkidx)?
+			.map(|b| self.metadata_blk(b.get())))
 	}
 
 	pub fn unlink(&mut self, dinr: InodeNum, name: &OsStr) -> IoResult<()> {

@@ -152,9 +152,12 @@ persists metadata.  What reaches it today:
 | `cg_blksfree[]`, `cg_iused[]` | staged, and the *same buffer* as the struct |
 | inodes | staged; a staged inode is visible to the running filesystem immediately |
 | indirect blocks | staged; a newly allocated one is zeroed through the cache |
+| directory blocks | staged; `inode_read_block`/`inode_write_block` route them here for `InodeType::Directory`, and *only* for that |
 | a new direct pointer | gated on `Gate::AllocationSafe` of the block it names |
 | a new indirect-block entry | gated on `Gate::AllocationSafe` of the block it names |
 | the inode pointer to a new indirect block | gated, as `DepKind::IndirectPointer` |
+| a new inode | `InodeDep`: its image and its bitmap bit, in two different buffers |
+| a new directory entry | its four-byte `di_ino` gated on `Gate::InodeWritten` |
 
 `sync_metadata()` drains: it publishes, writes, discharges whatever allocation
 events each completed write made true, and repeats until a pass writes nothing.
@@ -173,14 +176,23 @@ cylinder group's bitmap is never gated, so any write persists it, while a block'
 | path | why |
 |---|---|
 | ordinary file data | the kernel page cache is buffering it; a second layer would make every writeback an ordering question |
-| **directory blocks** | `dir_newlink()` and `readdir` use `inode_read`/`inode_write`.  This is what blocks `DirectoryAdd` |
 | the superblock | `update_sb()` writes it directly, and nothing gates it |
 | extended attributes | stored outside the block map |
+| directory *removal* | `dir_unlink()` writes the shrunken directory immediately; `Gate::InodeLinkCounted` has no operation raising it |
 
-Directory blocks are the notable one.  `DepKind::DirectoryAdd` cannot be raised
-until a directory block is a cached buffer, because `DependencyEngine::gate()`
-requires its block to be resident and would otherwise have nothing to mark
-unsafe.  Routing them through the cache is the next step.
+### Two asymmetries worth remembering
+
+**A block's contents need a full write; an inode's image does not.**  A block's
+contents *are* the live image, so only `Written::Full` persisted them.  An inode
+written safely with a pointer still gated is genuinely on the disk -- valid
+mode, size and link count, bitmap bit set -- which is all `InodeWritten` means.
+Requiring `Full` there deadlocks: a directory's inode always has a gated
+pointer, so its block is only ever written safely.
+
+**`InodeDep` exists because an inode has two halves, like a block.**  Its image
+lives in an inode block and its bitmap bit in a cylinder-group block, so the
+events are independent and either order is legal, exactly as for
+`NewBlockDep`.  `Gate::InodeWritten` opens on their conjunction.
 
 ## 4. What is not implemented
 
@@ -351,12 +363,14 @@ What is left, in order, each independently verifiable:
 
 1. ~~Raise `NewBlockDep` from `blk_alloc_for` and the direct-pointer gate from
    `inode_set_block`; write through the engine.~~  **Done.**
-2. Directory blocks through the cache.  `dir_newlink` writes a directory block
-   through `inode_write_block`, so a directory entry is currently *not* covered
-   by the cache at all.  This is what blocks `DirectoryAdd`, and it has to come
-   first: two writers to one block is the same bug the cylinder-group bitmaps
-   already had.
-3. `InodeUpdateDep` and `DirectoryAddDep` in `dir_newlink`/`mknod`.
+2. ~~Directory blocks through the cache, then `DirectoryAdd`.~~  **Done.**
+   Directory blocks are routed in `inode_read_block`/`inode_write_block` rather
+   than in `dir.rs`, because every directory path reaches them there; deciding
+   per-caller would give one block two writers, which is the bug the
+   cylinder-group bitmaps already had.
+3. ~~`DirectoryAdd` in `dir_newlink`.~~  **Done.**  `InodeUpdateDep` is not:
+   it covers the inode's own link-count and size transitions, which no
+   operation raises yet.
 4. `DirectoryRemoveDep` in `dir_try_unlink`/`rmdir` — the first operation whose
    *removal* ordering matters.
 5. `FreeBlocksDep` in `inode_shrink`/`inode_free`.

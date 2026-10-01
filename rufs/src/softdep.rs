@@ -359,11 +359,77 @@ impl NewBlockDep {
 	}
 }
 
+/// A newly allocated inode whose bitmap bit and image must both reach the disk
+/// before anything may name it.
+///
+/// # The crash this prevents
+///
+/// `mknod()` allocates an inode and then writes a directory entry naming it.
+///  If the entry reaches the disk first, a crash leaves a directory that lists
+///  a file whose inode bitmap bit is still clear.  `fsck_ffs` pass 2 sees the
+///  entry, resolves the inode number, finds an inode that is not allocated and
+///  whose fields are zero, and *clears the entry*.  The file's data was never
+///  lost -- it was never reachable again.
+///
+/// If the bitmap reaches the disk first, a crash leaves an allocated inode that
+///  nothing points at.  That is the benign direction: `fsck` pass 2 reclaims
+///  it.
+///
+/// # Why this is not just `NewBlockDep`
+///
+/// Because an inode has two halves on the disk, like a block, and only their
+/// conjunction is enough: the image, and the bitmap bit that says it is
+/// allocated.  The bitmap lives in the cylinder group's block, which is a
+/// *different* buffer from the one holding the inode, so the two events are
+/// genuinely independent -- and either order is legal, exactly as for blocks.
+///
+/// # Ordering
+///
+/// ```text
+///   allocate inode
+///        +-- inode bitmap bit ---+
+///        +-- inode image ---------+--> safe to name
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InodeDep {
+	id:     DepId,
+	inr:    InodeNum,
+	cg:     CgNum,
+	image:  bool,
+	bitmap: bool,
+}
+
+impl InodeDep {
+	/// This dependency's identifier.
+	pub fn id(&self) -> DepId {
+		self.id
+	}
+
+	/// The inode this dependency is about.
+	pub fn inr(&self) -> InodeNum {
+		self.inr
+	}
+
+	/// The cylinder group whose inode bitmap must be updated.
+	pub fn cg(&self) -> CgNum {
+		self.cg
+	}
+
+	/// Whether something may name this inode yet.
+	pub fn allows_naming(&self) -> bool {
+		self.image && self.bitmap
+	}
+}
+
 /// The write-ordering engine.
 #[derive(Debug, Default)]
 pub struct DependencyEngine {
 	next:       u64,
 	new_blocks: BTreeMap<DepId, NewBlockDep>,
+
+	/// `InodeDep`s indexed by the inode they are about.
+	inodes:   BTreeMap<DepId, InodeDep>,
+	by_inode: BTreeMap<InodeNum, DepId>,
 
 	/// `NewBlockDep`s indexed by the block they are about.
 	///
@@ -398,7 +464,7 @@ impl DependencyEngine {
 
 	/// Whether nothing is outstanding.
 	pub fn is_empty(&self) -> bool {
-		self.deps.is_empty() && self.new_blocks.is_empty()
+		self.deps.is_empty() && self.new_blocks.is_empty() && self.inodes.is_empty()
 	}
 
 	/// Register a newly allocated block.
@@ -440,6 +506,60 @@ impl DependencyEngine {
 	/// allocation events a completed write made true.
 	pub fn new_blocks(&self) -> impl Iterator<Item = &NewBlockDep> {
 		self.new_blocks.values()
+	}
+
+	/// Register a newly allocated inode.
+	pub fn new_inode(&mut self, inr: InodeNum, cg: CgNum) -> DepId {
+		let id = self.alloc_id();
+		self.inodes.insert(
+			id,
+			InodeDep {
+				id,
+				inr,
+				cg,
+				image: false,
+				bitmap: false,
+			},
+		);
+		self.by_inode.insert(inr, id);
+		id
+	}
+
+	/// Every outstanding inode allocation.
+	pub fn new_inodes(&self) -> impl Iterator<Item = &InodeDep> {
+		self.inodes.values()
+	}
+
+	/// Record that an inode's image has reached the device.
+	pub fn note_inode_written(&mut self, id: DepId) -> IoResult<bool> {
+		let dep = self.inodes.get_mut(&id).ok_or_else(|| invalid_dep(id))?;
+		dep.image = true;
+		let (inr, safe) = (dep.inr, dep.allows_naming());
+		self.settle_inode(inr);
+		Ok(safe)
+	}
+
+	/// Record that an inode's allocation bitmap bit has reached the device.
+	pub fn note_inode_bitmap_written(&mut self, id: DepId) -> IoResult<bool> {
+		let dep = self.inodes.get_mut(&id).ok_or_else(|| invalid_dep(id))?;
+		dep.bitmap = true;
+		let (inr, safe) = (dep.inr, dep.allows_naming());
+		self.settle_inode(inr);
+		Ok(safe)
+	}
+
+	fn settle_inode(&mut self, inr: InodeNum) {
+		if !self.gate_is_open(Gate::InodeWritten(inr)) {
+			return;
+		}
+		if let Some(ids) = self.waiting_on.remove(&Gate::InodeWritten(inr)) {
+			for id in ids {
+				if self.deps.get(&id).is_some_and(|d| d.resolved) {
+					continue;
+				}
+				self.publish_dep(id);
+			}
+		}
 	}
 
 	/// The allocation state of a new-block dependency.
@@ -631,7 +751,10 @@ impl DependencyEngine {
 	/// crash-consistent state and the cache can be discarded.
 	pub fn is_quiescent(&self) -> bool {
 		self.deps.values().all(|d| d.resolved) &&
-			self.new_blocks.values().all(|n| n.allows_publication())
+			self.new_blocks
+				.values()
+				.all(NewBlockDep::allows_publication) &&
+			self.inodes.values().all(InodeDep::allows_naming)
 	}
 
 	fn alloc_id(&mut self) -> DepId {
@@ -649,7 +772,12 @@ impl DependencyEngine {
 					.get(&id)
 					.is_some_and(NewBlockDep::allows_publication)
 			}
-			Gate::InodeWritten(_) |
+			Gate::InodeWritten(inr) => {
+				self.by_inode
+					.get(&inr)
+					.and_then(|id| self.inodes.get(id))
+					.is_some_and(InodeDep::allows_naming)
+			}
 			Gate::InodeLinkCounted(_) |
 			Gate::DirectoryPersisted { .. } |
 			Gate::InodeReclaimed(_) => false,

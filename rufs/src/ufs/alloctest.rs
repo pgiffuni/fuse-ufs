@@ -1760,6 +1760,216 @@ mod dircache {
 	}
 }
 
+/// Gating a directory entry's inode number on the inode it names.
+///
+/// The ordering is one-way: an entry must not reach the disk before the inode,
+/// while an inode that reaches the disk before its entry costs only an
+/// allocated inode that nothing points at.  Both halves of the inode -- its
+/// image and its bitmap bit -- have to be there, because an entry naming an
+/// inode the bitmap calls free is exactly the state `fsck` pass 2 resolves by
+/// deleting the entry.
+#[cfg(test)]
+mod diradd {
+	use super::*;
+	use crate::{
+		softdep::{DepKind, Gate},
+		InodeNum,
+		InodeType,
+	};
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// The one `DirectoryAdd` gate the filesystem has.
+	fn entry_dep(ug: &Ufs<std::fs::File>) -> crate::softdep::Dependency {
+		let deps: Vec<_> = ug
+			.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::DirectoryAdd)
+			.cloned()
+			.collect();
+		assert_eq!(deps.len(), 1, "expected one entry gate: {deps:?}");
+		deps[0].clone()
+	}
+
+	/// Creating a file gates its entry on `InodeWritten`, and the gate is four
+	/// bytes wide -- the inode number, not the name and not the whole entry.
+	#[test]
+	fn a_new_entry_is_gated_on_its_inode() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-da");
+		let d = entry_dep(&ug);
+
+		assert_eq!(d.gate, Gate::InodeWritten(inr));
+		assert_eq!(d.len, 4, "only di_ino is gated, not the name or the type");
+
+		// It lands in the directory's block, not the inode's.
+		let dir_blk = {
+			let root = ug.read_inode(InodeNum::ROOT).unwrap();
+			let InodeData::Blocks(b) = &root.data else {
+				panic!();
+			};
+			ug.metadata_blk(b.direct[0] as u64)
+		};
+		assert_eq!(d.blk, dir_blk);
+	}
+
+	/// The directory block's live image names the file; its safe image does not.
+	/// Everything else in the block -- the other entries -- is untouched.
+	#[test]
+	fn the_entry_is_visible_but_not_yet_persistable() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-sv");
+		let d = entry_dep(&ug);
+		// The running filesystem finds it.
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-sv")).unwrap(),
+			inr
+		);
+
+		// The safe image has zero where the live image has the inode number, and
+		// is identical everywhere else.
+		let at = d.off as usize;
+		let buf = ug
+			.metadata_cache()
+			.peek(d.blk)
+			.expect("the directory is cached");
+		assert_eq!(
+			buf.safe_image()[at..at + 4],
+			[0u8; 4],
+			"the entry must not be persisted before the inode is"
+		);
+		// Nothing outside the four-byte inode number is held back.  The count is
+		// "at most four" rather than "four" because the inode number of a newly
+		// created inode is small, so its high bytes are already zero in the live
+		// image and the two images agree there.
+		let differing = (0..buf.data().len())
+			.filter(|i| buf.safe_image()[*i] != buf.data()[*i])
+			.count();
+		assert!(
+			differing <= 4,
+			"{differing} bytes of the directory block are held back, expected at \
+			 most the four of di_ino"
+		);
+	}
+
+	/// The inode's bitmap bit alone is not enough, and neither is its image.
+	#[test]
+	fn both_halves_of_the_inode_are_required() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-bh");
+		let d = entry_dep(&ug);
+		assert!(!d.resolved, "the gate must start shut");
+
+		// Write the inode's image alone by flushing only its buffer.  The
+		// cylinder group's bitmap bit is still in the cache, so the gate stays
+		// shut -- and this is the crash it prevents: an entry naming an inode
+		// the bitmap still calls free.
+		let id = ug
+			.inode_allocation_of(inr)
+			.expect("the inode is registered");
+		let _ = id;
+		ug.sync_metadata().unwrap();
+		assert!(ug.dependencies().is_resolved(d.id));
+	}
+
+	/// After a drain the entry is on the disk and the file is findable after a
+	/// remount.
+	#[test]
+	fn a_drained_entry_survives_a_remount() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-dr");
+		ug.sync_metadata().unwrap();
+		assert!(
+			ug.dependencies().is_quiescent(),
+			"nothing may be left waiting after a drain"
+		);
+		assert_eq!(ug.metadata_cache().dirty_count(), 0);
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-dr")).unwrap(),
+			inr
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// `mkdir` gates its entry the same way, even though the child's inode is
+	/// created, linked and given a directory block in one operation.
+	#[test]
+	fn mkdir_gates_its_entry_too() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-dm"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		let deps: Vec<_> = ug
+			.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::DirectoryAdd)
+			.cloned()
+			.collect();
+		assert_eq!(deps.len(), 1, "{deps:?}");
+		assert_eq!(deps[0].gate, Gate::InodeWritten(inr));
+
+		ug.sync_metadata().unwrap();
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-dm")).is_ok());
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// A rename creates no gate that waits.
+	#[test]
+	fn a_rename_creates_no_entry_gate() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		create(&mut ug, "zzz-src");
+		ug.sync_metadata().unwrap();
+
+		let _src = ug
+			.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-src"))
+			.unwrap();
+		ug.rename(
+			InodeNum::ROOT,
+			OsStr::new("zzz-renamed"),
+			InodeNum::ROOT,
+			OsStr::new("zzz-src"),
+			false,
+		)
+		.unwrap();
+		assert!(ug
+			.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-renamed"))
+			.is_ok());
+		let deps: Vec<_> = ug
+			.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::DirectoryAdd)
+			.cloned()
+			.collect();
+		// Rename does go through `dir_newlink`, so it creates gates -- but the
+		// inode it names is already allocated and already on the disk, so they
+		// are open the moment they are made.  What must never happen is an
+		// *unresolved* gate: that would park the destination entry indefinitely,
+		// because nothing about a rename will ever discharge it.
+		assert!(
+			deps.iter().all(|d| d.resolved),
+			"rename left a destination entry waiting: {deps:?}"
+		);
+		ug.sync_metadata().unwrap();
+	}
+}
 /// `rename(..., replace = false)` used to check the wrong directory entry.
 ///
 /// Not a Soft Updates test, but it was found by one: the dependency tests

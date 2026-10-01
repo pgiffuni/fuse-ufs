@@ -370,6 +370,10 @@ impl<R: Backend> Ufs<R> {
 	///   which is not the same thing at all.
 	fn note_block_written(&mut self, blk: u64, how: Written) -> IoResult<()> {
 		let full = how == Written::Full;
+
+		// Block dependencies: the bitmap belongs to a cylinder group and is
+		// never gated, so any write persists it; the contents are the live
+		// image, so only a full write persisted them.
 		let mut bitmap: Vec<DepId> = Vec::new();
 		let mut contents: Vec<DepId> = Vec::new();
 		for dep in self.softdep.new_blocks() {
@@ -381,14 +385,53 @@ impl<R: Backend> Ufs<R> {
 			}
 		}
 		for id in bitmap {
-			log::trace!("note_block_written({blk}): bitmap for {id:?}");
+			log::trace!("note_block_written({blk}): block bitmap for {id:?}");
 			self.softdep.note_bitmap_written(id)?;
 		}
 		for id in contents {
-			log::trace!("note_block_written({blk}): contents for {id:?}");
+			log::trace!("note_block_written({blk}): block contents for {id:?}");
 			self.softdep.note_contents_written(id)?;
 		}
+
+		// Inode dependencies, which have the same shape: the bitmap bit belongs
+		// to the cylinder group and is never gated, while the inode's image is
+		// whatever the buffer held and may still have a gated pointer in it.
+		//
+		// Both inode events fire on *any* write, unlike the block contents
+		// event.  `InodeWritten` means "this inode exists and is allocated",
+		// and an inode whose image went out with a pointer still gated is
+		// exactly that: it has a valid mode, size and link count, and its bitmap
+		// bit is set.  What it does not yet have is the first block of its data,
+		// and that costs an empty file rather than a corrupt one -- the benign
+		// direction, and the one the gate is documented as accepting.
+		//
+		// Requiring `Written::Full` here instead would deadlock: a directory's
+		// inode always has a gated pointer, so its block is only ever written
+		// safely, and the entry naming it would never be publishable.
+		let mut ino_bitmap: Vec<DepId> = Vec::new();
+		let mut ino_image: Vec<DepId> = Vec::new();
+		for dep in self.softdep.new_inodes() {
+			if self.cg_blk(dep.cg()) == blk {
+				ino_bitmap.push(dep.id());
+			}
+			if self.inode_blk(dep.inr()) == blk {
+				ino_image.push(dep.id());
+			}
+		}
+		for id in ino_bitmap {
+			log::trace!("note_block_written({blk}): inode bitmap for {id:?}");
+			self.softdep.note_inode_bitmap_written(id)?;
+		}
+		for id in ino_image {
+			log::trace!("note_block_written({blk}): inode image for {id:?}");
+			self.softdep.note_inode_written(id)?;
+		}
 		Ok(())
+	}
+
+	/// The cache block holding `inr`'s inode.
+	fn inode_blk(&self, inr: InodeNum) -> u64 {
+		self.metadata_blk(self.superblock.ino_to_fsba(inr))
 	}
 }
 

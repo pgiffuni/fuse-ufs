@@ -685,6 +685,32 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
+	/// Register a newly allocated inode with the dependency engine.
+	///
+	/// Created by [`Self::hash_alloc_inode`], the one path by which an inode
+	/// becomes allocated.  The dependency says the inode's *bitmap bit* and its
+	/// *image* must both reach the disk before anything may name it; see
+	/// [`crate::softdep::InodeDep`] for the crash that prevents.
+	pub(super) fn register_new_inode(&mut self, inr: InodeNum) -> DepId {
+		let cg = self.superblock.ino_to_cg(inr);
+		let id = self.softdep.new_inode(inr, cg);
+		log::trace!("register_new_inode({inr}) in {cg}: {id:?}");
+		id
+	}
+
+	/// The allocation dependency for `inr`, if it is still outstanding.
+	///
+	/// Test-only, like the other `Ufs` internals: the engine looks this up by
+	/// inode itself, and a caller that could ask would be able to conclude
+	/// things about ordering that it has no business concluding.
+	#[cfg(test)]
+	pub(super) fn inode_allocation_of(&self, inr: InodeNum) -> Option<DepId> {
+		self.softdep
+			.new_inodes()
+			.find(|d| d.inr() == inr)
+			.map(|d| d.id())
+	}
+
 	/// Allocate one filesystem block and zero it.
 	///
 	/// Zeroing matters for two different reasons.  For a freshly allocated
@@ -814,9 +840,9 @@ impl<R: Backend> Ufs<R> {
 		}
 
 		if let Some(off) = self.alloc_cg_inode(pref, prefer_off)? {
-			return Ok(Some(unsafe {
-				InodeNum::new(self.superblock.cg_inode_base(pref) + off as u32)
-			}));
+			let inr = unsafe { InodeNum::new(self.superblock.cg_inode_base(pref) + off as u32) };
+			self.register_new_inode(inr);
+			return Ok(Some(inr));
 		}
 
 		let mut cg = pref.get() as u64;
@@ -825,9 +851,9 @@ impl<R: Backend> Ufs<R> {
 			cg = (cg + i) % ncg;
 			let c = CgNum::new(cg as u32);
 			if let Some(off) = self.alloc_cg_inode(c, None)? {
-				return Ok(Some(unsafe {
-					InodeNum::new(self.superblock.cg_inode_base(c) + off as u32)
-				}));
+				let inr = unsafe { InodeNum::new(self.superblock.cg_inode_base(c) + off as u32) };
+				self.register_new_inode(inr);
+				return Ok(Some(inr));
 			}
 			i *= 2;
 		}
@@ -836,9 +862,9 @@ impl<R: Backend> Ufs<R> {
 		for k in 2..ncg {
 			let c = CgNum::new(((icg + k) % ncg) as u32);
 			if let Some(off) = self.alloc_cg_inode(c, None)? {
-				return Ok(Some(unsafe {
-					InodeNum::new(self.superblock.cg_inode_base(c) + off as u32)
-				}));
+				let inr = unsafe { InodeNum::new(self.superblock.cg_inode_base(c) + off as u32) };
+				self.register_new_inode(inr);
+				return Ok(Some(inr));
 			}
 		}
 
