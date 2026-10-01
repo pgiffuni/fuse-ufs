@@ -1759,3 +1759,81 @@ mod dircache {
 		assert_eq!(ug.metadata_cache().dirty_count(), 0);
 	}
 }
+
+/// `rename(..., replace = false)` used to check the wrong directory entry.
+///
+/// Not a Soft Updates test, but it was found by one: the dependency tests
+/// create and rename files, and every rename failed.  Kept here because a
+/// regression in it is silent -- `rename` simply never succeeds.
+#[cfg(test)]
+mod renamefix {
+	use super::*;
+	use crate::{InodeNum, InodeType};
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// Renaming onto a name that does not exist must work, with
+	/// `replace = false`.
+	#[test]
+	fn rename_onto_a_free_name_succeeds() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-rn-src");
+		ug.sync_metadata().unwrap();
+
+		let got = ug
+			.rename(
+				InodeNum::ROOT,
+				OsStr::new("zzz-rn-dst"),
+				InodeNum::ROOT,
+				OsStr::new("zzz-rn-src"),
+				false,
+			)
+			.unwrap();
+		assert_eq!(got, inr, "the renamed file kept its inode");
+		assert!(ug
+			.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rn-dst"))
+			.is_ok());
+		assert!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rn-src"))
+				.is_err(),
+			"the old name is still there"
+		);
+	}
+
+	/// And onto one that does exist it must still fail, which is the whole point
+	/// of `replace = false`.
+	#[test]
+	fn rename_onto_an_existing_name_still_fails() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		create(&mut ug, "zzz-rn-a");
+		create(&mut ug, "zzz-rn-b");
+
+		let e = ug
+			.rename(
+				InodeNum::ROOT,
+				OsStr::new("zzz-rn-b"),
+				InodeNum::ROOT,
+				OsStr::new("zzz-rn-a"),
+				false,
+			)
+			.unwrap_err();
+		assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+		assert!(ug
+			.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rn-a"))
+			.is_ok());
+		assert!(ug
+			.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rn-b"))
+			.is_ok());
+	}
+}

@@ -372,8 +372,14 @@ impl<R: Backend> Ufs<R> {
 		let inr = self.dir_lookup(s_dinr, s_name)?;
 
 		if !replace {
-			// User has requested to error if the destination already exists
-			match self.dir_lookup(s_dinr, s_name) {
+			// The user has requested an error if the destination already exists.
+			//
+			// The *destination*: this used to look the *source* up, which is a
+			// tautology -- `dir_lookup(s_dinr, s_name)` above already succeeded,
+			// or `rename` would not have got this far -- so `replace = false`
+			// failed with EEXIST for every rename, including onto a name that did
+			// not exist.  The `replace` branch below got it right.
+			match self.dir_lookup(d_dinr, d_name) {
 				Ok(_) => return Err(err!(EEXIST)),
 				// TODO: Need raw OS error here?
 				Err(e) if e.kind() == ErrorKind::NotFound => {}
