@@ -249,17 +249,28 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
-	pub(super) fn inode_find_block(
-		&mut self,
+	/// Where a file offset falls, without the panic.
+	///
+	/// `None` means the offset is beyond the end of the geometry `i_size`
+	/// implies, which is the filesystem saying "there is nothing here" rather
+	/// than "something is broken" — the caller decides whether that is `EOF`,
+	/// a hole or an error.
+	///
+	/// The last block of a file is the fragment case: `i_size % fs_bsize` bytes
+	/// that UFS2 accounts for as a run of `fs_fsize` fragments, so its size is
+	/// the rounded-up remainder rather than a whole `fs_bsize`.  Every caller
+	/// that assumed otherwise would over-read the last block.
+	pub(super) fn inode_locate(
+		&self,
 		inr: InodeNum,
 		ino: &Inode,
 		offset: u64,
-	) -> BlockInfo {
+	) -> Option<BlockInfo> {
 		let bs = self.superblock.bsize as u64;
 		let fs = self.superblock.fsize as u64;
 		let (blocks, frags) = ino.size(bs, fs);
 		log::trace!(
-			"inode_find_block({inr}, {offset}): size={}, bs={bs}, blocks={blocks}, fs={fs}, frags={frags}",
+			"inode_locate({inr}, {offset}): size={}, bs={bs}, blocks={blocks}, fs={fs}, frags={frags}",
 			ino.size
 		);
 
@@ -276,10 +287,29 @@ impl<R: Backend> Ufs<R> {
 				size:   frags * fs,
 			}
 		} else {
-			panic!("inode_find_block({inr}, {offset}): out of bounds");
+			return None;
 		};
-		log::trace!("inode_find_block({inr}, {offset}) = {x:?}");
-		x
+		log::trace!("inode_locate({inr}, {offset}) = {x:?}");
+		Some(x)
+	}
+
+	/// [`Self::inode_locate`], panicking when the offset is out of bounds.
+	///
+	/// The read and write paths use this because they have already clamped to
+	/// `i_size`, so being out of bounds is a bug in *them* and not something
+	/// the caller asked for.  The mapping layer uses [`Self::inode_locate`],
+	/// because an arbitrary offset past the end of a file is a perfectly good
+	/// question.
+	pub(super) fn inode_find_block(
+		&mut self,
+		inr: InodeNum,
+		ino: &Inode,
+		offset: u64,
+	) -> BlockInfo {
+		match self.inode_locate(inr, ino, offset) {
+			Some(x) => x,
+			None => panic!("inode_find_block({inr}, {offset}): out of bounds"),
+		}
 	}
 
 	pub(super) fn inode_data_zones(&self) -> (u64, u64, u64, u64) {

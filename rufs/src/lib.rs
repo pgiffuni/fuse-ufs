@@ -23,5 +23,5 @@ pub use crate::{
 	data::{InodeAttr, InodeNum, InodeType},
 	geom::{AllocationSummary, CgNum},
 	softdep::{DepId, DepKind, DependencyEngine, Gate},
-	ufs::{fsck::Report, Info, Ufs},
+	ufs::{fsck::Report, mapping::BlockMapping, runs::BlockRun, Info, Ufs},
 };

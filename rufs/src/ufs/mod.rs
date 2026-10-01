@@ -60,6 +60,9 @@ fn metadata_cache(sb: &Superblock) -> IoResult<BufferCache> {
 	Ok(BufferCache::new(bsize, fsize))
 }
 
+pub mod mapping;
+pub mod runs;
+
 mod meta;
 
 /// Summary of filesystem statistics.

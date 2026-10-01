@@ -657,7 +657,7 @@ impl<R: Backend> Ufs<R> {
 		// allocation lands.
 		self.blk_free(bno, self.superblock.bsize as u64)?;
 		log::trace!("inode_free_block({bno}): old_blocks={}", ino.blocks);
-		// Saturate rather than wrap: a block found outside the inode's extent
+		// Saturate rather than wrap: a block found outside the inode's size
 		// (see `inode_free_l1`) was never charged to `i_blocks`, and
 		// underflowing here would turn a recoverable inconsistency into a
 		// wildly wrong block count.
