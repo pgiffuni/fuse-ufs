@@ -1,6 +1,7 @@
 #![cfg_attr(fuzzing, allow(dead_code, unused_imports, unused_mut))]
 
 mod blockreader;
+mod buf;
 mod data;
 mod decoder;
 mod geom;
@@ -17,6 +18,7 @@ pub const ENOATTR: i32 = libc::ENODATA;
 
 pub use crate::{
 	blockreader::{Backend, BlockReader},
+	buf::{BlockDevice, Buffer, BufferCache},
 	data::{InodeAttr, InodeNum, InodeType},
 	geom::{AllocationSummary, CgNum},
 	ufs::{fsck::Report, Info, Ufs},
