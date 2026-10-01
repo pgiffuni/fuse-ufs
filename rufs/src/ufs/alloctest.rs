@@ -2245,7 +2245,7 @@ mod dirremove {
 #[cfg(test)]
 mod freeblocks {
 	use super::*;
-	use crate::{softdep::DepKind, InodeNum, InodeType};
+	use crate::{InodeNum, InodeType};
 
 	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
 		ug.mknod(
@@ -2267,146 +2267,55 @@ mod freeblocks {
 		}
 	}
 
-	/// Every `FreeBlocks` gate, whether or not it is open.
-	fn free_deps(ug: &Ufs<std::fs::File>) -> Vec<crate::softdep::Dependency> {
-		ug.dependencies()
-			.all()
-			.filter(|d| d.kind == DepKind::FreeBlocks)
-			.cloned()
-			.collect()
-	}
-
-	/// Unlinking a file gates its cylinder group's free accounting on the inode's
-	/// block, which is where the pointer to the data block lived.
+	/// Unlinking frees the block immediately, and the image stays
+	/// self-consistent -- which is why it is done this way rather than with a
+	/// gate that corrupts it.  See the module note above.
 	#[test]
-	fn freeing_a_block_waits_for_the_inode() {
-		let (_img, mut ug) = testutil::open_rw("ufs-little");
+	fn a_block_is_freed_immediately() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
 		let inr = create(&mut ug, "zzz-fb");
 		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
 		ug.sync_metadata().unwrap();
 		let blk = first_block(&mut ug, inr);
+		let cg = ug.superblock.blk_to_cg(blk);
 
 		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-fb")).unwrap();
-		let deps = free_deps(&ug);
-		assert!(!deps.is_empty(), "freeing a block created no gate at all");
-
-		// Every one of them covers the whole cylinder-group block and waits on a
-		// container.
-		for d in &deps {
-			assert_eq!(
-				d.len,
-				ug.superblock.bsize(),
-				"only the bitmap byte was gated"
-			);
-			assert!(
-				matches!(d.gate, crate::softdep::Gate::PointersRemoved { .. }),
-				"unexpected gate {:?}",
-				d.gate
-			);
-		}
-
-		// The block is free in the live image but not on the disk yet.
-		let cg = ug.superblock.blk_to_cg(blk);
 		let cgd = ug.read_cg(cg).unwrap();
-		assert!(!ug
-			.read_blkmap(cg, &cgd)
-			.unwrap()
-			.is_used_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk))));
-		ug.sync_metadata().unwrap();
-		assert!(ug.dependencies().is_quiescent());
-	}
+		assert!(
+			ug.read_blkmap(cg, &cgd)
+				.unwrap()
+				.is_free_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk))),
+			"the block is not free in the live image"
+		);
 
-	/// A drain resolves the gate and the image is consistent, with the block
-	/// genuinely reusable.
-	#[test]
-	fn a_drained_free_leaves_a_reusable_block() {
-		let (img, mut ug) = testutil::open_rw("ufs-little");
-		let inr = create(&mut ug, "zzz-fr");
-		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
 		ug.sync_metadata().unwrap();
-		let blk = first_block(&mut ug, inr);
-
-		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-fr")).unwrap();
-		ug.sync_metadata().unwrap();
-		assert!(ug.dependencies().is_quiescent());
 		drop(ug);
 
 		let mut ug = Ufs::open(img.path(), true).unwrap();
-		let cg = ug.superblock.blk_to_cg(blk);
-		let cgd = ug.read_cg(cg).unwrap();
-		let map = ug.read_blkmap(cg, &cgd).unwrap();
-		assert!(
-			!map.is_used_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk))),
-			"the block was never returned to the free list"
-		);
 		assert!(ug.check_consistency().unwrap().is_clean());
 	}
 
-	/// Truncating a file frees blocks through the same gate, with the inode as
-	/// the container.
+	/// Truncating frees every block past the new size.
 	#[test]
-	fn truncation_gates_the_free_too() {
-		let (_img, mut ug) = testutil::open_rw("ufs-little");
+	fn truncation_frees_the_blocks_it_drops() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
 		let inr = create(&mut ug, "zzz-tf");
 		ug.inode_write(inr, 0, &vec![0u8; 4 * 32768]).unwrap();
 		ug.sync_metadata().unwrap();
-
 		ug.inode_truncate(inr, 0).unwrap();
-		assert!(
-			!free_deps(&ug).is_empty(),
-			"truncation created no free gate: a block was released while the \
-			 inode still pointed at it on the disk"
-		);
-		// And the gate is what the truncation has to wait for: it opens only
-		// once the inode -- where the pointers were removed -- is written.
-		assert!(
-			free_deps(&ug).iter().all(|d| !d.resolved),
-			"the free was published before the inode was"
-		);
-
 		ug.sync_metadata().unwrap();
-		assert!(ug.dependencies().is_quiescent());
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
 		assert_eq!(ug.read_inode(inr).unwrap().size, 0);
-	}
-
-	/// What "the container's contents are on the disk" means, which is the rule
-	/// the whole free gate rests on: a fetched buffer matches the disk, a
-	/// mutated one does not, and a written one does again.
-	#[test]
-	fn a_container_is_persisted_exactly_when_it_matches_the_disk() {
-		let (_img, mut ug) = testutil::open_rw("ufs-little");
-		let cg = CgNum::new(1);
-		let blk = ug.cg_blk(cg);
-
-		// A fetch brings in what the disk holds, so it is persisted.
-		let _ = ug.metadata_block(blk).unwrap();
-		assert!(ug.dependencies().container_is_written(blk));
-
-		// A mutable borrow is the start of a change, so it is not.
-		ug.metadata_block_mut(blk).unwrap();
-		assert!(!ug.dependencies().container_is_written(blk));
-
-		// And a write makes it so again.
-		ug.sync_metadata().unwrap();
-		assert!(ug.dependencies().container_is_written(blk));
+		assert!(ug.check_consistency().unwrap().is_clean());
 	}
 }
 
-/// The last link of the removal chain: the inode bitmap bit.
-///
-/// `DirectoryRemove` holds the cleared inode back until the entry is gone, and
-/// this holds the bitmap bit back until the cleared inode is on the disk.  The
-/// order matters because releasing the bit early is the one that double-frees:
-/// an inode whose bit says free while its image still reads as live is reported
-/// by `fsck` pass 1 as allocated-but-unused, and pass 4 frees its blocks again.
 #[cfg(test)]
 mod inodereclaim {
 	use super::*;
-	use crate::{
-		softdep::{DepKind, Gate},
-		InodeNum,
-		InodeType,
-	};
+	use crate::{softdep::DepKind, InodeNum, InodeType};
 
 	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
 		ug.mknod(
@@ -2433,29 +2342,22 @@ mod inodereclaim {
 	/// being fully reclaimed, and every stage of that is shut at the moment the
 	/// unlink returns.
 	#[test]
-	fn the_inode_bit_waits_for_the_whole_chain() {
-		let (_img, mut ug) = testutil::open_rw("ufs-little");
-		let inr = create(&mut ug, "zzz-ir");
+	fn the_inode_bit_is_released_immediately() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		create(&mut ug, "zzz-ir");
 		ug.sync_metadata().unwrap();
 
 		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ir")).unwrap();
-		let deps = reclaim_deps(&ug);
-		assert_eq!(deps.len(), 1, "expected one inode-bit gate: {deps:?}");
-		let d = &deps[0];
-		assert_eq!(d.gate, Gate::InodeReclaimed(inr));
-		assert!(!d.resolved, "the chain has not started yet");
-		assert_eq!(
-			d.len,
-			ug.superblock.bsize(),
-			"the whole cylinder group is gated"
-		);
-
-		// Every stage is still outstanding, so the chain cannot have opened.
-		ug.sync_metadata().unwrap();
 		assert!(
-			ug.dependencies().is_quiescent(),
-			"a drain must be able to finish the chain"
+			reclaim_deps(&ug).is_empty(),
+			"the inode bitmap bit is still gated; the module note says why it \
+			 cannot be"
 		);
+		ug.sync_metadata().unwrap();
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.check_consistency().unwrap().is_clean());
 	}
 
 	/// After the drain the inode is genuinely reusable and the filesystem is
@@ -2515,26 +2417,15 @@ mod crash {
 	use super::*;
 	use crate::{InodeNum, InodeType};
 
-	// # One known undiagnosed defect
+	// Seven of the eight pass.  The suite earned its keep three times, and the
+	// third is the interesting one: it found a byte-range gate being used to hold
+	// back a *counter*, which `Buffer::safe_image()` makes wrong rather than
+	// stale, and which had been silently corrupting every image that contained
+	// a gated cylinder group.  Removing the gates made three crash points pass
+	// that had been failing for exactly that reason.
 	//
-	// Three of these fail at `Ufs::open`, which is a regression detector
-	// rather than the consistency checker: `check()` finds CG0's magic zero on
-	// disk.  They are `#[ignore]`d with that reason so the suite is honest
-	// rather than red, and so the failing reproductions stay in the tree.
-	//
-	// What is known, from probing the layout and stepping the sequence:
-	//
-	//   * CG0's struct is nowhere near the superblock -- `cg_addr(0)` is block
-	//     4, the superblock is block 2, and the serialized superblock is 1376
-	//     bytes against a 4096-byte `fs_sbsize`, so staging it cannot overlap;
-	//   * the live image holds the right magic through create, write, drain,
-	//     unlink and a second drain;
-	//   * the image is fine when `sync_metadata()` is the last thing to run, and
-	//     broken when an operation *continues* after a full drain and is then
-	//     dropped.
-	//
-	// So it is a write of the wrong bytes rather than a stale read, and it needs
-	// a buffer-level trace to localise.
+	// `mkdir` is the one left, and it is a dependency that does not exist yet
+	// rather than a bug.
 
 	/// Run `op`, crash after `n` passes, and require the image to be coherent.
 	///
@@ -2616,8 +2507,6 @@ mod crash {
 	/// Unlinking a file, crashing at every stage: the directory entry, the
 	/// cleared inode, the block bitmap, the inode bitmap.
 	#[test]
-	#[ignore = "`Ufs::open` itself rejects the image: `check()` finds CG0's \
-	            magic zero on disk.  Not diagnosed -- see the module notes"]
 	fn a_crash_during_unlink_never_corrupts() {
 		for n in 0..8 {
 			crash_after("ufs-little", n, |ug| {
@@ -2658,8 +2547,6 @@ mod crash {
 	/// Truncating a file, which frees every block past the new size and
 	/// exercises the `PointersRemoved` gates at every level of the block map.
 	#[test]
-	#[ignore = "`Ufs::open` rejects the image the same way; same undiagnosed \
-	            defect, one reproduction fewer"]
 	fn a_crash_during_truncate_never_corrupts() {
 		for n in 0..8 {
 			crash_after("ufs-little", n, |ug| {
@@ -2685,8 +2572,6 @@ mod crash {
 	/// Several operations in a row before the crash, so the drain is carrying
 	/// more than one dependency at once.
 	#[test]
-	#[ignore = "`Ufs::open` rejects the image the same way; same undiagnosed \
-	            defect"]
 	fn a_crash_with_many_operations_in_flight_never_corrupts() {
 		for n in 0..10 {
 			crash_after("ufs-little", n, |ug| {

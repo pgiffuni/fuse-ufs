@@ -171,6 +171,37 @@ advance a dependency, and the two events are deliberately asymmetric: a
 cylinder group's bitmap is never gated, so any write persists it, while a block's
 *contents* are the live image, so only a `Written::Full` write persisted them.
 
+### What a byte-range gate cannot express
+
+`Buffer` holds a gated range back by **zeroing** it in the safe image.  That is
+right for a pointer -- zero *is* "no pointer here" -- and wrong for anything
+else, because zero is a different and wrong value rather than a stale one.
+
+That makes the byte-range model unusable for two of the dependencies below:
+
+* `FreeBlocksDep` -- holding `cs_nbfree` back zeroed reports a full filesystem
+  as empty.
+* `InodeReclaim` -- holding `cs_nifree` back has the same problem.
+
+Both were attempted with gates, and the crash-point suite is what proved them
+unsound.  The first attempt gated the whole `fs_bsize` block, and the suite came
+back with `check()` rejecting an image whose CG0 magic was zero.  Narrowing it to
+`cg_cs` plus the one bitmap byte was no better: "cg_cs.cs_nifree is 0 but the
+inode bitmap has 248 free inodes".  Removing both gates is what made three
+crash points pass.
+
+Both need FreeBSD's *deferral*: record the free as pending against the container
+and perform it in a later pass, once the container has been written.  That is a
+work list rather than a gate, and it is the shape both of them have to take.
+Until then both are done immediately, which keeps the image self-consistent and
+leaves the crash window open.  `Ufs::blk_free()` takes the container of the
+removed pointer and every caller threads it, so the work list has the argument
+it needs.
+
+The gates that *are* wired -- `NewBlockDep`, `DirectPointer`,
+`IndirectPointer`, `DirectoryAdd`, `DirectoryRemove` -- all gate pointers or a
+directory entry's inode number, which is exactly the case zeroing is right for.
+
 ### Still direct
 
 | path | why |
