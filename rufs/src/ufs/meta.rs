@@ -344,18 +344,32 @@ impl<R: Backend> Ufs<R> {
 		// terminates -- the loop is bounded by the number of dirty buffers.
 		let mut total = 0;
 		loop {
-			self.softdep.publish_into(&mut self.buf);
-			let written = self.softdep.write_ready(&mut self.buf, &mut self.file)?;
-			for (blk, how) in &written {
-				self.note_block_written(*blk, *how)?;
-			}
-			if written.is_empty() {
+			let n = self.sync_metadata_one_pass()?;
+			if n == 0 {
 				break;
 			}
-			total += written.len();
+			total += n;
 		}
 		log::trace!("sync_metadata(): wrote {total} buffer(s)");
 		Ok(())
+	}
+
+	/// Run exactly one pass of the drain, and report how many buffers it wrote.
+	///
+	/// This is what a *crash point* is: stop after the Nth pass, throw away
+	/// everything still in memory, and look at what the disk says.  Testing only
+	/// the fully-drained result would miss every intermediate state, and those
+	/// are the ones the ordering rules exist to make safe.
+	///
+	/// Private because nothing outside the crash harness has a reason to stop
+	/// half way: a caller that wanted persistence wants [`Self::sync_metadata`].
+	pub(super) fn sync_metadata_one_pass(&mut self) -> IoResult<usize> {
+		self.softdep.publish_into(&mut self.buf);
+		let written = self.softdep.write_ready(&mut self.buf, &mut self.file)?;
+		for (blk, how) in &written {
+			self.note_block_written(*blk, *how)?;
+		}
+		Ok(written.len())
 	}
 
 	/// Turn a completed write-back into the allocation events it made true.

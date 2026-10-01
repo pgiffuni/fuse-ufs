@@ -313,10 +313,26 @@ impl<R: Backend> Ufs<R> {
 		self.alloc.note_inode_alloc(cg, is_dir);
 	}
 
+	/// Update the primary superblock and stage it.
+	///
+	/// Staged like every other piece of metadata, which it did not used to be.
+	/// `fs_cstotal` is a summary of the cylinder-group counters, so writing it
+	/// straight to the device let the totals move while the cylinder groups it
+	/// summarises were still sitting in a dirty buffer -- and a crash in between
+	/// left `fs_cstotal` disagreeing with the bitmaps, which is the first thing
+	/// the crash-point suite found.  `fsck` pass 5 reports it as
+	/// "fs_cstotal.cs_nbfree is 48 but the cylinder-group bitmaps hold 49".
+	///
+	/// Staging alone is not the whole ordering -- the totals must not reach the
+	/// disk *before* the cylinder groups they summarise -- but it puts both in
+	/// the same write pass, in dirty order, and the CG block is always dirtied
+	/// before this by every caller: `finish_alloc()` and `alloc_cg_inode()`
+	/// stage the struct and bitmaps first and ask for the totals afterwards.
 	fn update_sb(&mut self, f: impl FnOnce(&mut Superblock)) -> IoResult<()> {
 		// Only update the first superblock, because we're lazy.
 		f(&mut self.superblock);
-		self.file.encode_at(SBLOCK_UFS2 as u64, &self.superblock)?;
+		let sb = self.superblock.clone();
+		self.metadata_write(SBLOCK_UFS2 as u64, &sb)?;
 		Ok(())
 	}
 }

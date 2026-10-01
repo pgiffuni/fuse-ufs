@@ -206,6 +206,14 @@ impl<T: Read + Write + Seek> Decoder<T> {
 		self.write(buf)
 	}
 
+	/// Serialize `x` and write it to the file at `pos`.
+	///
+	/// Kept for symmetry with [`Self::decode_at`], and because it is the obvious
+	/// thing to reach for when a new random-access write path appears.  Note
+	/// that no UFS metadata write uses it any more: every one of them goes
+	/// through the buffer cache, because a write that bypasses the cache
+	/// bypasses the dependency engine with it.
+	#[allow(dead_code)]
 	pub fn encode_at(&mut self, pos: u64, x: &impl Encode) -> Result<()> {
 		self.seek(pos)?;
 		self.encode(x)

@@ -65,6 +65,24 @@ pub struct Problem {
 
 	/// Human-readable description.
 	pub msg: String,
+
+	/// Whether this is a *contradiction* or merely an *incompleteness*.
+	///
+	/// The two look the same to a caller and are not the same at all:
+	///
+	/// * a contradiction is the disk disagreeing with itself -- a pointer to a
+	///   block the bitmap calls free, a superblock total that does not match the
+	///   bitmaps, a directory entry naming an inode that does not exist.  No
+	///   crash point may ever produce one.
+	/// * an incompleteness is work that was started and not finished -- an
+	///   allocated inode no directory entry names yet, a block nobody points at.
+	///   `fsck` "repairs" these by moving them to lost+found; they are what a
+	///   half-completed operation looks like from the outside.
+	///
+	/// [`Report::is_coherent`] is the question the crash-point suite asks, and
+	/// the distinction exists for that: a create that wrote its inode but not
+	/// its directory entry is not corruption.
+	pub contradiction: bool,
 }
 
 impl std::fmt::Display for Problem {
@@ -91,12 +109,31 @@ impl Report {
 		self.problems.push(Problem {
 			pass,
 			msg: msg.into(),
+			contradiction: true,
+		});
+	}
+
+	/// Record something that is unfinished rather than self-contradictory.
+	fn incomplete(&mut self, pass: u8, msg: impl Into<String>) {
+		self.problems.push(Problem {
+			pass,
+			msg: msg.into(),
+			contradiction: false,
 		});
 	}
 
 	/// Whether the filesystem passed every check.
 	pub fn is_clean(&self) -> bool {
 		self.problems.is_empty()
+	}
+
+	/// Whether the image is at least self-consistent.
+	///
+	/// True when nothing on the disk contradicts anything else on it, whether or
+	/// not the image is finished: a crash can leave an operation half applied,
+	/// and that is not the same as leaving it inconsistent.
+	pub fn is_coherent(&self) -> bool {
+		self.problems.iter().all(|p| !p.contradiction)
 	}
 
 	/// A one-line summary, for `assert!` messages.
@@ -256,11 +293,20 @@ impl<R: Backend> Ufs<R> {
 				continue;
 			}
 
+			// An allocated inode that cannot be read is not necessarily
+			// corruption.  A crash between the bitmap write and the inode's own
+			// image leaves exactly that, and `read_inode()` rejects it because
+			// there is no file type.  `fsck` pass 1 calls this "allocated inode
+			// probably lost"; here it is an *incompleteness*, and the checker has
+			// to be able to say so or it cannot look at a crashed image at all.
 			let ino = match self.read_inode(inr) {
 				Ok(ino) => ino,
 				Err(e) => {
 					log::warn!("check: {inr} unreadable: {e}");
-					rep.problem(1, format!("{inr}: allocated in the bitmap but unreadable"));
+					rep.incomplete(
+						1,
+						format!("{inr}: allocated but its image is not on the disk"),
+					);
 					continue;
 				}
 			};
@@ -504,7 +550,7 @@ impl<R: Backend> Ufs<R> {
 		// Pass 3: every allocated inode must be reachable from the root.
 		for ino in nlink_on_disk.keys() {
 			if !reached.contains(ino) {
-				rep.problem(
+				rep.incomplete(
 					3,
 					format!("{ino}: allocated but not reachable from the root"),
 				);
