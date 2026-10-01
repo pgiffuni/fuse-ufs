@@ -24,10 +24,11 @@ UFS operation
     +--> metadata / inode / directory modification
     |
     v
-dirty buffers                        (done: rufs/src/buf.rs, not yet in the
-    |                                  write path)
-    v
-dependency engine                    (partial: rufs/src/softdep.rs)
+dirty buffers                        (done: rufs/src/buf.rs, wired in for
+    |                                  cylinder groups, inodes and indirect
+    v                                  blocks -- rufs/src/ufs/meta.rs)
+dependency engine                    (partial: rufs/src/softdep.rs, no
+    |                                  dependencies raised yet)
     |
     v
 safe write scheduling
@@ -298,15 +299,21 @@ and for what the checker deliberately does not implement.
 
 ## 7. Order of work
 
-Phases 1–7 are done.  The remaining phases are ordered so that each one is
-independently verifiable:
+Phases 1–7 are done, and so is phase 8's first half: the `BufferCache` is wired
+into the cylinder-group, inode and indirect-block write paths, and
+`Ufs::sync_metadata()` is the one thing that persists metadata.  Phase 8 is
+*not* finished, because directory blocks are still written directly and because
+nothing raises a dependency yet -- so `sync_metadata()` currently writes
+everything, ungated.  That is the same behaviour as before, minus the immediacy.
 
-1. Wire `BufferCache` into the inode, directory and cylinder-group write paths,
-   keeping `write_back()` in the driver's hands so behaviour is unchanged.
-   Verifiable by the existing 92 tests.
-2. Raise `NewBlockDep` from `blk_alloc_for` and `DirectPointerDep` from
+What is left, in order, each independently verifiable:
+
+1. Raise `NewBlockDep` from `blk_alloc_for` and `DirectPointerDep` from
    `inode_set_block`; write through the engine.  Verifiable by
    `crash_at_each_intermediate_point` end-to-end with the crash harness.
+2. Directory blocks through the cache.  `dir_newlink` writes a data block
+   through `inode_write_block`, so a directory entry is currently *not* covered
+   by the cache at all -- which is why `DirectoryAddDep` is not in the list below.
 3. `InodeUpdateDep` and `DirectoryAddDep` in `dir_newlink`/`mknod`.
 4. `DirectoryRemoveDep` in `dir_try_unlink`/`rmdir` — the first operation whose
    *removal* ordering matters.

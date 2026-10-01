@@ -5,12 +5,30 @@ use std::{
 };
 
 use cfg_if::cfg_if;
-use fuser::{FileAttr, Filesystem, KernelConfig, ReplyEmpty, Request, TimeOrNow};
+use fuser::{
+	FileAttr,
+	Filesystem,
+	KernelConfig,
+	ReplyBmap,
+	ReplyEmpty,
+	ReplyLseek,
+	Request,
+	TimeOrNow,
+};
 use rufs::{InodeAttr, InodeNum, InodeType};
 
 use crate::{consts::*, Fs};
 
 const MAX_CACHE: Duration = Duration::MAX;
+
+/// The unit FUSE's `bmap` uses for both its block index and its answer.
+///
+/// `struct fuse_bmap_in` carries a `sector_t` block index and the kernel's
+/// `fuse_bmap()` returns a `sector_t`, so the file offset is `idx * 512` and
+/// the reply is a device byte offset divided by 512.  Not `fs_bsize`: the
+/// `blocksize` field is the *superblock's* block size, and a UFS block is a
+/// fragment, so neither of them is the unit of the answer.
+const SECTOR: u64 = 512;
 
 fn run<T>(f: impl FnOnce() -> IoResult<T>) -> Result<T, c_int> {
 	f().map_err(|e| {
@@ -510,6 +528,112 @@ impl Filesystem for Fs {
 
 		match run(f) {
 			Ok(()) => reply.ok(),
+			Err(e) => reply.error(e),
+		}
+	}
+
+	/// Map a block of a file to a block of the underlying image.
+	///
+	/// # The units, which are the whole difficulty
+	///
+	/// The kernel sends the file-relative block index in **512-byte sectors**,
+	/// and its `blocksize` field is the *superblock's* block size, which for a
+	/// FUSE mount is whatever the mount option said.  The reply is a sector on
+	/// the underlying device.
+	///
+	/// A UFS block number is a *fragment* address, so the conversion is:
+	///
+	/// ```text
+	/// file offset = idx * 512
+	/// device offset = ufs_block * fs_fsize
+	/// reply = device offset / 512
+	/// ```
+	///
+	/// and dividing by `fs_bsize` anywhere in there is a factor-of-`fs_frag`
+	/// error that still produces a plausible-looking number.
+	///
+	/// # Zero means "not mapped"
+	///
+	/// The protocol has no way to say "this is a hole", so 0 is the answer for
+	/// one.  That is unambiguous here because UFS never allocates block 0.
+	///
+	/// # When this is called at all
+	///
+	/// Only for a `blkdev` mount, because the kernel only asks a filesystem to
+	/// do bmap when there is a block device behind it.
+	fn bmap(&mut self, _req: &Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: ReplyBmap) {
+		// `blocksize` is informational: the file offset comes from `idx`, which
+		// is already in sectors.
+		log::trace!("bmap(ino={ino:#x}, blocksize={blocksize}, idx={idx})");
+		let f = || {
+			let inr = transino(ino)?;
+			let offset = idx
+				.checked_mul(SECTOR)
+				.ok_or_else(|| IoError::from_raw_os_error(libc::EOVERFLOW))?;
+			Ok(match self.ufs.inode_map_offset(inr, offset)? {
+				rufs::BlockMapping::Data { block, .. } => {
+					let device = block
+						.checked_mul(self.ufs.fsize())
+						.ok_or_else(|| IoError::from_raw_os_error(libc::EOVERFLOW))?;
+					if device % SECTOR != 0 {
+						// A UFS fragment that is not sector-aligned cannot be
+						// named in this protocol at all.  UFS2's `fs_fsize` is a
+						// multiple of the sector size, so this should be
+						// unreachable; saying so beats rounding silently.
+						return Err(IoError::from_raw_os_error(libc::EINVAL));
+					}
+					device / SECTOR
+				}
+				// A hole, and end of file alike: both are "not mapped".
+				_ => 0,
+			})
+		};
+		match run(f) {
+			Ok(block) => reply.bmap(block),
+			Err(e) => reply.error(e),
+		}
+	}
+
+	/// `lseek(SEEK_DATA)` and `lseek(SEEK_HOLE)`.
+	///
+	/// The kernel sends `whence` as `SEEK_DATA` (3) or `SEEK_HOLE` (4), which
+	/// arrive unchanged as `FUSE_SEEK_DATA`/`FUSE_SEEK_HOLE`.  Anything else is
+	/// `EINVAL`: ordinary `SEEK_SET`/`SEEK_CUR`/`SEEK_END` are VCS operations
+	/// and never reach a filesystem.
+	///
+	/// # About ENXIO
+	///
+	/// `EINVAL` is what the ABI asks for here and `ENXIO` is what
+	/// `rufs::Ufs::inode_seek_data` returns for "no data at or after this
+	/// offset".  Note that the kernel's FUSE lseek path has historically turned
+	/// any reply other than `ENOSYS` into `EIO` before handing it to the caller,
+	/// so a user of a mount on such a kernel may observe `EIO` where the
+	/// protocol says `ENXIO`.  Replying with the documented code is still the
+	/// right thing: it is what the protocol specifies and what a kernel that
+	/// preserves it needs.
+	fn lseek(
+		&mut self,
+		_req: &Request<'_>,
+		ino: u64,
+		_fh: u64,
+		offset: i64,
+		whence: i32,
+		reply: ReplyLseek,
+	) {
+		let f = || {
+			let inr = transino(ino)?;
+			if offset < 0 {
+				return Err(IoError::from_raw_os_error(libc::EINVAL));
+			}
+			let offset = offset as u64;
+			match whence as libc::c_int {
+				libc::SEEK_DATA => self.ufs.inode_seek_data(inr, offset),
+				libc::SEEK_HOLE => self.ufs.inode_seek_hole(inr, offset),
+				_ => Err(IoError::from_raw_os_error(libc::EINVAL)),
+			}
+		};
+		match run(f) {
+			Ok(at) => reply.offset(at as i64),
 			Err(e) => reply.error(e),
 		}
 	}

@@ -18,6 +18,16 @@ access (e.g. mounting a big-endian filesystem on a little-endian host).
 - **Extended attributes** (ACLs not yet supported)
 - Cross-platform FUSE backends: `fuse3` (Linux, FreeBSD) and `fuse2` (OpenBSD)
 
+## Documentation
+
+| file | what it covers |
+|---|---|
+| [docs/fuse-compatibility.md](docs/fuse-compatibility.md) | `bmap`, `lseek(SEEK_DATA/SEEK_HOLE)`, and which platforms reach them |
+| [docs/soft-updates.md](docs/soft-updates.md) | the dependency model and what is implemented |
+| [docs/ufs2-invariants.md](docs/ufs2-invariants.md) | the on-disk invariants a crash must not break |
+| [docs/freebsd-ufs2.md](docs/freebsd-ufs2.md) | behaviour mined from FreeBSD's implementation |
+| [fuse-ufs(8)](docs/fuse-ufs.8) | the manual page |
+
 ## Planned
 
 - Read & write support for Sun/Solaris UFSv2

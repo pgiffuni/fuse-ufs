@@ -10,6 +10,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The MSRV is now 1.90.0.
 
+### Add
+
+- `rufs`: a metadata `BufferCache`, so that UFS metadata is staged rather than
+  written through.  Cylinder-group structs, both bitmaps, inodes and indirect
+  blocks all go through it now; `Ufs::sync_metadata()` is the only thing that
+  persists them.
+- `rufs`: `BlockMapping`, `BlockRun` and the `inode_block_runs` iterator —
+  canonical logical-to-physical mapping for a UFS file, walking the block map so
+  a sparse region is skipped in one step.
+- `rufs`: `inode_seek_data()` and `inode_seek_hole()`.
+- `fuse-ufs`: `bmap`, and `lseek` for `SEEK_DATA`/`SEEK_HOLE`.
+
+### Fix
+
+- A cylinder-group struct and its bitmaps share one `fs_bsize` block.  With the
+  struct staged through the cache and the bitmaps still written straight to the
+  device, the next write-back of that block rolled the bitmaps back: an
+  allocation whose counter survived and whose bit did not.
+
 ## [0.6.0] - 2025-09-27
 
 ### General
