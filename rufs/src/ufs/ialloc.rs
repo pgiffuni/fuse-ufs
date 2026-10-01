@@ -1,9 +1,22 @@
 use std::mem::replace;
 
 use super::*;
-use crate::{err, InodeNum};
+use crate::{err, policy::BlockRole, InodeNum};
 
 const STAT_BLKSIZE: u64 = 512;
+
+/// The allocation role a request implies, given the inode it belongs to.
+///
+/// Indirect blocks always take the [`BlockRole::Indirect`] role; data blocks
+/// follow the inode's type, which is the distinction that makes a directory's
+/// blocks land in the metadata zone while a file's land in the data zone.
+fn role_for(ino: &Inode, role: BlockRole) -> BlockRole {
+	match role {
+		BlockRole::Indirect { .. } => role,
+		_ if ino.kind() == InodeType::Directory => BlockRole::DirectoryData,
+		_ => BlockRole::FileData,
+	}
+}
 
 impl<R: Backend> Ufs<R> {
 	fn inode_setup(&mut self, inr: InodeNum, ino: &mut Inode) -> IoResult<()> {
@@ -29,56 +42,78 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
-	pub(super) fn inode_alloc(&mut self, ino: &mut Inode) -> IoResult<InodeNum> {
+	/// Allocate an inode, placing it according to the UFS2 policy.
+	///
+	/// `parent` is the directory the new inode is being created in, or `None`
+	/// when there is no parent (recovery).  It decides the cylinder group:
+	///
+	/// * a directory uses the dirpref scheme ([`crate::policy::pref_inode`]),
+	///   which spreads a filesystem's top-level directories but clusters deep
+	///   ones near their parent;
+	/// * anything else simply follows its parent, which keeps a directory and
+	///   the files directly inside it in one cylinder group.
+	///
+	/// Both may fall back to any cylinder group with space, through the same
+	/// cylinder-overflow search the block allocator uses.
+	pub(super) fn inode_alloc(
+		&mut self,
+		parent: Option<InodeNum>,
+		ino: &mut Inode,
+	) -> IoResult<InodeNum> {
 		self.assert_rw()?;
-		let sb = &self.superblock;
-		let ipg = sb.ipg as u64;
-		assert_eq!(ipg % 8, 0);
+		let is_dir = ino.kind() == InodeType::Directory;
 
-		for cgi in 0..sb.ncg {
-			let cga = self.cg_addr(cgi.into());
-			let mut cg: CylGroup = self.file.decode_at(cga)?;
-
-			if cg.cs.nifree <= 0 {
-				continue;
+		let parent_info = match parent {
+			Some(pinr) => {
+				let pino = self.read_inode(pinr)?;
+				Some(crate::policy::ParentInfo {
+					inr:   pinr,
+					// A parent that does not record its depth (an image made
+					// before i_dirdepth was tracked) reads as depth 0, which
+					// the policy treats as "untracked" and falls back to the
+					// parent's cylinder group.
+					depth: pino.dir_depth().unwrap_or(0),
+					nlink: pino.nlink,
+				})
 			}
+			None => None,
+		};
 
-			let off = cga + cg.iusedoff as u64;
+		let pref_cg = crate::policy::pref_inode(
+			&self.superblock,
+			crate::policy::InodePrefInput {
+				parent: parent_info,
+				is_dir,
+				cgs: &self.cg_sums,
+				alloc: &self.alloc,
+			},
+		);
 
-			for i in 0..(ipg / 8) {
-				let addr = i + off;
-				let mut b: u8 = self.file.decode_at(addr)?;
-				log::debug!("addr={addr:#x} b = {b:#x}");
-				if b == 0xff {
-					continue;
-				}
-
-				let j = (0..8)
-					.enumerate()
-					.find(|(_, idx)| (b & (1 << idx)) == 0)
-					.unwrap()
-					.1;
-
-				b |= 1 << j;
-				self.file.encode_at(addr, &b)?;
-
-				let inr = cgi as u64 * ipg + i * 8 + j as u64;
-				let inr = unsafe { InodeNum::new(inr as u32) };
-
-				log::trace!("inode_alloc(): {inr}");
-				self.inode_setup(inr, ino)?;
-
-				// update free count in CG
-				cg.cs.nifree -= 1;
-				self.file.encode_at(cga, &cg)?;
-
-				self.update_sb(|sb| sb.cstotal.nifree -= 1)?;
-
-				return Ok(inr);
-			}
+		// A directory's depth must be in the inode before it is written, so
+		// that the very first version of the inode on disk already carries it.
+		if is_dir {
+			let depth = parent_info.map_or(1, |p| p.depth + 1);
+			ino.set_dir_depth(depth);
 		}
 
-		Err(err!(ENOSPC))
+		let inr = self.hash_alloc_inode(pref_cg, None)?.ok_or(err!(ENOSPC))?;
+		log::trace!("inode_alloc(): {inr}");
+
+		self.inode_setup(inr, ino)?;
+
+		// The directory count is what makes the dirpref policy self-limiting:
+		// is the denominator of "how much of this cylinder group is already
+		// spoken for by directories".
+		if is_dir {
+			let cg = self.superblock.ino_to_cg(inr);
+			let mut cgd = self.read_cg(cg)?;
+			cgd.cs.ndir += 1;
+			self.write_cg(cg, &cgd)?;
+			self.update_sb(|sb| sb.cstotal.ndir += 1)?;
+		}
+		self.note_inode_alloc(self.superblock.ino_to_cg(inr), is_dir);
+
+		Ok(inr)
 	}
 
 	pub(super) fn read_pblock(&mut self, bno: u64, block: &mut [u64]) -> IoResult<()> {
@@ -109,6 +144,22 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
+	/// Read one entry of an indirect block.
+	fn indir_get(&mut self, bno: u64, idx: u64) -> IoResult<u64> {
+		let fs = self.superblock.fsize as u64;
+		self.file
+			.decode_at(bno * fs + idx * size_of::<UfsDaddr>() as u64)
+	}
+
+	/// Write one entry of an indirect block.
+	fn indir_set(&mut self, bno: u64, idx: u64, val: u64) -> IoResult<()> {
+		let fs = self.superblock.fsize as u64;
+		self.file.encode_at(
+			bno * fs + idx * size_of::<UfsDaddr>() as u64,
+			&(val as UfsDaddr),
+		)
+	}
+
 	fn inode_free_l1(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
 		if bno == 0 {
 			return Ok(());
@@ -116,17 +167,39 @@ impl<R: Backend> Ufs<R> {
 
 		self.read_pblock(bno, block)?;
 
+		let (blocks, frags) = ino.size(self.superblock.bsize(), self.superblock.fsize());
+		let end = blocks + frags.min(1);
+
 		for (idx, bno) in block.iter().enumerate() {
 			if *bno == 0 {
 				continue;
 			}
-			let size = self.inode_get_block_size(ino, idx as u64);
-			self.inode_free_block(ino, *bno, size as u64)?;
+			// Entries past the end of the file should not exist in a
+			// consistent filesystem, but they are cheap to tolerate and
+			// `inode_get_block_size()` would otherwise panic.  Such a block
+			// is still ours to free: it is inside an indirect block that this
+			// inode owns.
+			let lbn = self.inode_l1_offset(ino, idx as u64);
+			if lbn < end {
+				let size = self.inode_get_block_size(ino, lbn);
+				self.inode_free_block(ino, *bno, size as u64)?;
+			} else {
+				log::warn!(
+					"inode_free_l1: indirect block holds a pointer at lbn {lbn}, \
+					 past the end of the file ({end} blocks); freeing it whole"
+				);
+				self.inode_free_block(ino, *bno, self.superblock.bsize())?;
+			}
 		}
 
 		self.blk_free(bno, self.superblock.bsize as u64)?;
 
 		Ok(())
+	}
+
+	/// Logical block number of entry `idx` of a single-indirect block.
+	fn inode_l1_offset(&self, _ino: &Inode, idx: u64) -> u64 {
+		UFS_NDADDR as u64 + idx
 	}
 
 	fn inode_free_l2(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
@@ -184,56 +257,42 @@ impl<R: Backend> Ufs<R> {
 			return Ok(());
 		}
 
-		let sb = &self.superblock;
+		let is_dir = ino.kind() == InodeType::Directory;
 
-		// clear the inode
-		let off = self.superblock.ino_to_fso(inr);
-		self.file.fill_at(off, 0u8, UFS_INOSZ)?;
-
-		// calculate the cylinder group number and offset for the inode.
-		let (cgi, cgo) = self.superblock.ino_in_cg(inr);
-		let cga = self.cg_addr(cgi);
-		let mut cg: CylGroup = self.file.decode_at(cga)?;
-
-		if cg.magic != CG_MAGIC {
-			panic!("inode_free({inr}): invalid cylinder group: cgi={cgi}, cga={cga:08x}");
-		}
-
-		// free the inode in the inode bitmap
-		let off = cga + cg.iusedoff as u64 + cgo / 8;
-		let mut b: u8 = self.file.decode_at(off)?;
-		let mask = 1 << (cgo % 8);
-		if (b & mask) != mask {
-			panic!("inode_free({inr}): double-free: cgi={cgi}, cgo={cgo}, cga={cga:08x}, off={off:08x}, b={b:02x}, iusedoff={:02x}, ipg={}", cg.iusedoff, sb.ipg);
-		}
-		b &= !mask;
-		self.file.encode_at(off, &b)?;
-
-		// update the CG's free inode count
-		cg.cs.nifree += 1;
-		// TODO: update cg.time
-		self.file.encode_at(cga, &cg)?;
-
-		self.update_sb(|sb| sb.cstotal.nifree += 1)?;
-
-		if let InodeData::Blocks(blocks) = &ino.data {
+		// Release the inode's blocks *before* its bitmap entry.  The order
+		// matters after a crash: an inode that is still marked used in
+		// cg_iused[] is visible to fsck phase 4, which will follow its
+		// pointers and free them, whereas a block whose inode has vanished is
+		// simply lost space.
+		if let InodeData::Blocks(blocks) = ino.data.clone() {
 			let bs = self.superblock.bsize as u64;
 			let mut block = vec![0u64; bs as usize / size_of::<u64>()];
 
-			// free direct blocks
 			for i in 0..UFS_NDADDR {
 				let bno = blocks.direct[i] as u64;
 				if bno == 0 {
 					continue;
 				}
 				let size = self.inode_get_block_size(&ino, i as u64);
-				self.blk_free(bno, size as u64)?;
+				self.inode_free_block(&mut ino, bno, size as u64)?;
 			}
 
-			let blocks = blocks.clone();
 			self.inode_free_l1(&mut ino, blocks.indirect[0] as u64, &mut block)?;
 			self.inode_free_l2(&mut ino, blocks.indirect[1] as u64, &mut block)?;
 			self.inode_free_l3(&mut ino, blocks.indirect[2] as u64, &mut block)?;
+		}
+
+		// Now the inode itself.  `i_blocks` goes to zero first so that a crash
+		// between here and the bitmap clear leaves a self-consistent inode.
+		ino.blocks = 0;
+		self.write_inode(inr, &ino)?;
+
+		let off = self.superblock.ino_to_fso(inr);
+		self.file.fill_at(off, 0u8, UFS_INOSZ)?;
+
+		self.free_cg_inode(inr)?;
+		if is_dir {
+			self.free_cg_dir(inr)?;
 		}
 
 		Ok(())
@@ -242,8 +301,8 @@ impl<R: Backend> Ufs<R> {
 	fn inode_shrink(&mut self, ino: &mut Inode, new_size: u64) -> IoResult<()> {
 		let (begin_indir1, begin_indir2, begin_indir3, _) = self.inode_data_zones();
 		let sb = &self.superblock;
-		let bs = sb.bsize as u64;
-		let fs = sb.fsize as u64;
+		let bs = sb.bsize();
+		let fs = sb.fsize();
 		let (blocks, frags) = Inode::inode_size(bs, fs, new_size);
 		log::trace!("inode_shrink(): blocks={blocks}, frags={frags}");
 		let blocks = blocks + (frags > 0) as u64;
@@ -382,6 +441,12 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
+	/// Store `block` at `blkidx` in `ino`, allocating any indirect blocks the
+	/// path needs on the way.
+	///
+	/// Any indirect block created here is allocated with
+	/// [`BlockRole::Indirect`], which is what places the *first* one right
+	/// after the last direct block and later ones in the metadata zone.
 	fn inode_set_block(
 		&mut self,
 		inr: InodeNum,
@@ -389,12 +454,6 @@ impl<R: Backend> Ufs<R> {
 		blkidx: u64,
 		block: NonZeroU64,
 	) -> IoResult<()> {
-		let sb = &self.superblock;
-		let bs = sb.bsize as u64;
-		let su64 = size_of::<UfsDaddr>() as u64;
-		let pbp = bs / su64;
-		let mut data = vec![0u64; pbp as usize];
-
 		let InodeData::Blocks(InodeBlocks { direct, indirect }) = &mut ino.data else {
 			log::warn!(
 				"inode_set_block({inr}, {blkidx}, {block}): inode doesn't haave data blocks"
@@ -402,6 +461,8 @@ impl<R: Backend> Ufs<R> {
 			return Err(err!(EIO));
 		};
 
+		let last_direct = direct[UFS_NDADDR - 1] as u64;
+		let first_indirect = indirect[0] as u64;
 		let mut wb = false;
 
 		match self.decode_blkidx(blkidx)? {
@@ -411,59 +472,101 @@ impl<R: Backend> Ufs<R> {
 			}
 			InodeBlock::Indirect1(off) => {
 				if indirect[0] == 0 {
-					indirect[0] = self.blk_alloc_full_zeroed()?.get() as i64;
+					indirect[0] = self
+						.blk_alloc_zeroed_for(
+							BlockRole::Indirect { first: true },
+							inr,
+							blkidx,
+							0,
+							last_direct,
+							first_indirect,
+						)?
+						.get() as i64;
 					wb = true;
 				}
 
-				let x1 = indirect[0] as u64;
-				self.read_pblock(x1, &mut data)?;
-				data[off] = block.get();
-				self.write_pblock(x1, &data)?;
+				self.indir_set(indirect[0] as u64, off as u64, block.get())?;
 			}
 			InodeBlock::Indirect2(high, low) => {
 				if indirect[1] == 0 {
-					indirect[1] = self.blk_alloc_full_zeroed()?.get() as i64;
+					indirect[1] = self
+						.blk_alloc_zeroed_for(
+							BlockRole::Indirect { first: false },
+							inr,
+							blkidx,
+							0,
+							last_direct,
+							first_indirect,
+						)?
+						.get() as i64;
 					wb = true;
 				}
 
 				let x1 = indirect[1] as u64;
-				self.read_pblock(x1, &mut data)?;
-
-				if data[high] == 0 {
-					data[high] = self.blk_alloc_full_zeroed()?.get();
-					self.write_pblock(x1, &data)?;
-				}
-
-				let x2 = data[high];
-				self.read_pblock(x2, &mut data)?;
-				data[low] = block.get();
-				self.write_pblock(x2, &data)?;
+				let x2 = self.indir_get(x1, high as u64)?;
+				let x2 = if x2 == 0 {
+					let b = self.blk_alloc_zeroed_for(
+						BlockRole::Indirect { first: false },
+						inr,
+						blkidx,
+						0,
+						last_direct,
+						first_indirect,
+					)?;
+					self.indir_set(x1, high as u64, b.get())?;
+					b.get()
+				} else {
+					x2
+				};
+				self.indir_set(x2, low as u64, block.get())?;
 			}
 			InodeBlock::Indirect3(high, mid, low) => {
 				if indirect[2] == 0 {
-					indirect[2] = self.blk_alloc_full_zeroed()?.get() as i64;
+					indirect[2] = self
+						.blk_alloc_zeroed_for(
+							BlockRole::Indirect { first: false },
+							inr,
+							blkidx,
+							0,
+							last_direct,
+							first_indirect,
+						)?
+						.get() as i64;
 					wb = true;
 				}
 
 				let x1 = indirect[2] as u64;
-				self.read_pblock(x1, &mut data)?;
-
-				if data[high] == 0 {
-					data[high] = self.blk_alloc_full_zeroed()?.get();
-					self.write_pblock(x1, &data)?;
-				}
-
-				let x2 = data[high];
-				self.read_pblock(x2, &mut data)?;
-				if data[mid] == 0 {
-					data[mid] = self.blk_alloc_full_zeroed()?.get();
-					self.write_pblock(x2, &data)?;
-				}
-
-				let x3 = data[mid];
-				self.read_pblock(x3, &mut data)?;
-				data[low] = block.get();
-				self.write_pblock(x3, &data)?;
+				let x2 = self.indir_get(x1, high as u64)?;
+				let x2 = if x2 == 0 {
+					let b = self.blk_alloc_zeroed_for(
+						BlockRole::Indirect { first: false },
+						inr,
+						blkidx,
+						0,
+						last_direct,
+						first_indirect,
+					)?;
+					self.indir_set(x1, high as u64, b.get())?;
+					b.get()
+				} else {
+					x2
+				};
+				let x3 = self.indir_get(x2, mid as u64)?;
+				let x3 = if x3 == 0 {
+					let b = self.blk_alloc_zeroed_for(
+						BlockRole::Indirect { first: false },
+						inr,
+						blkidx,
+						0,
+						last_direct,
+						first_indirect,
+					)?;
+					self.indir_set(x2, mid as u64, b.get())?;
+					b.get()
+				} else {
+					x3
+				};
+				self.indir_set(x3, low as u64, block.get())?;
 			}
 		}
 
@@ -474,6 +577,8 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
+	/// Allocate a block of file or directory data for `inr` and store it at
+	/// `blkidx`.
 	pub(super) fn inode_alloc_block(
 		&mut self,
 		inr: InodeNum,
@@ -481,11 +586,28 @@ impl<R: Backend> Ufs<R> {
 		blkidx: u64,
 		size: u64,
 	) -> IoResult<(NonZeroU64, u64)> {
-		let (block, block_size) = self.blk_alloc(size)?;
-		log::trace!(
-			"inode_alloc_block({inr}): old_blocks: {}, block_size={block_size}",
-			ino.blocks
-		);
+		let role = role_for(ino, BlockRole::FileData);
+
+		// The policy needs to know where the previous logical block went (to
+		// continue a contiguous run), where the last direct block is (so the
+		// first indirect block can follow it) and where the first indirect
+		// block is (so its first data block can follow it).
+		let (prev, last_direct, first_indirect) = match &ino.data {
+			InodeData::Blocks(b) => {
+				let prev = if blkidx == 0 {
+					0
+				} else {
+					self.inode_resolve_block(inr, ino, blkidx - 1)?
+						.map_or(0, |b| b.get())
+				};
+				(prev, b.direct[UFS_NDADDR - 1] as u64, b.indirect[0] as u64)
+			}
+			InodeData::Shortlink(_) => (0, 0, 0),
+		};
+
+		log::trace!("inode_alloc_block({inr}): old_blocks: {}", ino.blocks);
+		let block = self.blk_alloc_for(role, inr, blkidx, prev, last_direct, first_indirect)?;
+		let block_size = self.superblock.bsize as u64;
 		ino.blocks += block_size / STAT_BLKSIZE;
 		log::trace!("inode_alloc_block({inr}): new_blocks: {}", ino.blocks);
 		self.inode_set_block(inr, ino, blkidx, block)?;
@@ -495,10 +617,20 @@ impl<R: Backend> Ufs<R> {
 		Ok((block, block_size))
 	}
 
-	fn inode_free_block(&mut self, ino: &mut Inode, bno: u64, size: u64) -> IoResult<()> {
-		self.blk_free(bno, size)?;
-		log::trace!("inode_free_block({bno}, {size}): old_blocks={}", ino.blocks);
-		ino.blocks -= size / STAT_BLKSIZE;
+	fn inode_free_block(&mut self, ino: &mut Inode, bno: u64, _size: u64) -> IoResult<()> {
+		// Allocation always takes a whole block (see the module docs of
+		// `balloc`), so freeing must as well; `size` is kept in the signature
+		// to document the caller's intent and to be used once fragment
+		// allocation lands.
+		self.blk_free(bno, self.superblock.bsize as u64)?;
+		log::trace!("inode_free_block({bno}): old_blocks={}", ino.blocks);
+		// Saturate rather than wrap: a block found outside the inode's extent
+		// (see `inode_free_l1`) was never charged to `i_blocks`, and
+		// underflowing here would turn a recoverable inconsistency into a
+		// wildly wrong block count.
+		ino.blocks = ino
+			.blocks
+			.saturating_sub((self.superblock.bsize as u64) / STAT_BLKSIZE);
 		Ok(())
 	}
 }

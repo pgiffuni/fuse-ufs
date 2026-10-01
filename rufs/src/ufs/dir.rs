@@ -438,7 +438,7 @@ impl<R: Backend> Ufs<R> {
 		self.assert_rw()?;
 		check_name_is_legal(name, false)?;
 		let mut ino = Inode::new(kind, perm, uid, gid, self.superblock.bsize as u32);
-		let inr = self.inode_alloc(&mut ino)?;
+		let inr = self.inode_alloc(Some(dinr), &mut ino)?;
 		self.dir_newlink(dinr, inr, name, kind)?;
 		Ok(ino.as_attr(inr))
 	}

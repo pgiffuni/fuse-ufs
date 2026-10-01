@@ -8,8 +8,11 @@ use std::{
 	path::Path,
 };
 
+#[cfg(test)]
+mod alloctest;
 mod balloc;
 mod dir;
+pub mod fsck;
 mod ialloc;
 mod inode;
 mod symlink;
@@ -19,7 +22,8 @@ use crate::{
 	blockreader::{Backend, BlockReader},
 	data::*,
 	decoder::{Config, Decoder},
-	CgNum,
+	geom::{AllocationSummary, CgNum},
+	policy::CgSums,
 };
 
 /// (INTERNAL) Constructs an [`std::io::Error`] from an `errno`.
@@ -63,6 +67,21 @@ pub struct Info {
 pub struct Ufs<R: Backend> {
 	file:       Decoder<BlockReader<R>>,
 	superblock: Superblock,
+
+	/// Runtime-only allocation bookkeeping.
+	///
+	/// Never serialized: see [`AllocationSummary`].  Keeping it here rather
+	/// than in the on-disk superblock is what allows a read-only mount and
+	/// keeps the image byte-identical to what `newfs` produces.
+	alloc: AllocationSummary,
+
+	/// Cached per-cylinder-group `csum` values.
+	///
+	/// The allocation policies need to compare *every* cylinder group's free
+	/// counts, and re-reading a 32 KiB cylinder-group superblock per
+	/// comparison would be absurd.  This cache is only ever updated by
+	/// [`Ufs::write_cg`], so it cannot drift from the on-disk structures.
+	cg_sums: CgSums,
 }
 
 impl Ufs<File> {
@@ -102,8 +121,15 @@ impl<R: Backend> Ufs<R> {
 				superblock.magic
 			);
 		}
-		let mut s = Self { file, superblock };
+		let mut s = Self {
+			file,
+			superblock,
+			alloc: AllocationSummary::new(0),
+			cg_sums: CgSums::default(),
+		};
 		s.check()?;
+		s.cg_sums = s.read_cg_sums()?;
+		s.alloc = AllocationSummary::new(s.superblock.ncg);
 		Ok(s)
 	}
 
@@ -199,6 +225,33 @@ impl<R: Backend> Ufs<R> {
 
 	fn cg_addr(&self, cg: CgNum) -> u64 {
 		self.superblock.cg_addr(cg)
+	}
+
+	/// Gather the `csum` of every cylinder group.
+	///
+	/// Only needed at mount time, to seed the policy cache.  The cache itself
+	/// lives in [`Self::cg_sums`] and is maintained by [`Self::write_cg`].
+	pub(super) fn read_cg_sums(&mut self) -> IoResult<CgSums> {
+		let mut sums = Vec::with_capacity(self.superblock.ncg as usize);
+		for i in 0..self.superblock.ncg {
+			let cg: CylGroup = self.file.decode_at(self.cg_addr(CgNum::new(i)))?;
+			sums.push(cg.cs);
+		}
+		Ok(CgSums::new(&sums))
+	}
+
+	/// Runtime-only allocation bookkeeping.
+	///
+	/// Exposed for tests and for the eventual `tunefs`-style reporting; not
+	/// part of the on-disk format.
+	#[allow(dead_code)]
+	pub(super) fn alloc_summary(&self) -> &AllocationSummary {
+		&self.alloc
+	}
+
+	/// Record that an inode was allocated in `cg`.
+	pub(super) fn note_inode_alloc(&mut self, cg: CgNum, is_dir: bool) {
+		self.alloc.note_inode_alloc(cg, is_dir);
 	}
 
 	fn update_sb(&mut self, f: impl FnOnce(&mut Superblock)) -> IoResult<()> {

@@ -5,6 +5,9 @@ mod data;
 mod decoder;
 mod geom;
 mod inode;
+mod policy;
+#[cfg(test)]
+mod testutil;
 mod ufs;
 
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
@@ -16,5 +19,5 @@ pub use crate::{
 	blockreader::{Backend, BlockReader},
 	data::{InodeAttr, InodeNum, InodeType},
 	geom::{AllocationSummary, CgNum},
-	ufs::{Info, Ufs},
+	ufs::{fsck::Report, Info, Ufs},
 };

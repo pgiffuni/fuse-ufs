@@ -160,7 +160,7 @@ pub const DT_WHT: u8 = 14;
 /// read in from fs_csaddr (size fs_cssize) in addition to the
 /// super block.
 /// `struct csum` in FreeBSD
-#[derive(Debug, Decode, Encode)]
+#[derive(Debug, Decode, Encode, Clone, Copy, PartialEq, Eq)]
 pub struct Csum {
 	pub ndir:   i32, // number of directories
 	pub nbfree: i32, // number of free blocks
@@ -169,7 +169,7 @@ pub struct Csum {
 }
 
 /// `struct csum_total` in FreeBSD
-#[derive(Debug, Decode, Encode)]
+#[derive(Debug, Decode, Encode, Clone, Copy, PartialEq, Eq)]
 pub struct CsumTotal {
 	pub ndir:        i64,      // number of directories
 	pub nbfree:      i64,      // number of free blocks
@@ -181,7 +181,7 @@ pub struct CsumTotal {
 
 /// Super block for an FFS filesystem.
 /// `struct fs` in FreeBSD
-#[derive(Debug, Decode, Encode)]
+#[derive(Debug, Decode, Encode, Clone)]
 pub struct Superblock {
 	pub firstfield:       i32, // historic filesystem linked list,
 	pub unused_1:         i32, // used for incore super blocks

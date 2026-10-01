@@ -513,15 +513,20 @@ impl AllocationSummary {
 	}
 }
 
+/// Synthetic superblocks for unit tests that must not depend on a real image.
 #[cfg(test)]
-mod t {
+pub(crate) mod tests {
 	use super::*;
 
 	/// A small but *realistic* UFS2 geometry, matching the parameters
 	/// `newfs -b 32768 -f 4096` produces for a 4 MiB filesystem with a
 	/// 4 KiB superblock: 4 CGs, 264 fragments each, 256 inodes each, and a
 	/// metadata reservation of 8 blocks at the head of each data zone.
-	fn sb() -> Superblock {
+	///
+	/// The field values were read out of `resources/ufs-little.img.zst`, so
+	/// anything derived from this superblock is validated against a real
+	/// `newfs(8)` output rather than against my imagination.
+	pub(crate) fn superblock_for_tests() -> Superblock {
 		Superblock {
 			firstfield:       0,
 			unused_1:         0,
@@ -630,6 +635,15 @@ mod t {
 			spare5:           [0; 2],
 			magic:            FS_UFS2_MAGIC,
 		}
+	}
+}
+
+#[cfg(test)]
+mod t {
+	use super::{tests::superblock_for_tests, *};
+
+	fn sb() -> Superblock {
+		superblock_for_tests()
 	}
 
 	/// Every cylinder-group geometry assertion, checked for the first, a
