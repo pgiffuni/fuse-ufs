@@ -221,12 +221,47 @@ impl<R: Backend> Ufs<R> {
 		let size = self.inode_get_block_size(ino, blkidx);
 		match self.inode_resolve_block(inr, ino, blkidx)? {
 			Some(blkno) => {
-				self.file.read_at(blkno.get() * fs, &mut buf[0..size])?;
+				if Self::blocks_are_metadata(ino) {
+					// Read the *live* image, not the disk.  A directory block
+					// that has been extended but not flushed is the common
+					// case right after a link, and reading past the cache would
+					// make the new entry invisible to the very lookup that is
+					// about to find it.
+					let at = blkno.get() * fs;
+					buf[0..size].copy_from_slice(&self.metadata_read_at(at, size)?);
+				} else {
+					self.file.read_at(blkno.get() * fs, &mut buf[0..size])?;
+				}
 			}
 			None => buf.fill(0u8),
 		}
 
 		Ok(size)
+	}
+
+	/// Whether `ino`'s data blocks are filesystem metadata rather than file
+	/// data.
+	///
+	/// A directory's blocks are not a file's bytes.  They hold the entries that
+	/// make a name resolvable, and Soft Updates has to be able to hold *one
+	/// entry* back while the rest of the block goes out, so they belong in the
+	/// metadata cache exactly like inode blocks and indirect blocks do.
+	///
+	/// This has to be decided here rather than in `dir.rs` because every
+	/// directory path -- `dir_iter`, `dir_newlink`, `dir_unlink`,
+	/// `inode_copy_range`, `inode_truncate` -- reaches its blocks through the
+	/// generic read and write below.  Gating an entry in `dir_newlink` while
+	/// every other directory path went straight to the device would give one
+	/// block two writers, which is the same mistake the cylinder-group bitmaps
+	/// already made: the write-back of the cached block would restore whatever
+	/// the direct write had replaced.
+	///
+	/// A *file's* blocks deliberately stay direct.  The kernel page cache is
+	/// already buffering them, there are no ordering constraints between two
+	/// blocks of a file's payload, and a second layer would turn every FUSE
+	/// writeback into an ordering question for no benefit.
+	fn blocks_are_metadata(ino: &Inode) -> bool {
+		ino.kind() == InodeType::Directory
 	}
 
 	pub(super) fn inode_write_block(
@@ -245,6 +280,15 @@ impl<R: Backend> Ufs<R> {
 			None => self.inode_alloc_block(inr, ino, blkidx, size as u64)?.0,
 		};
 
+		if Self::blocks_are_metadata(ino) {
+			// Staged, not written.  Whether this block may reach the disk -- and
+			// which of its entries may -- is the dependency engine's decision,
+			// and `sync_metadata()` is the only thing that carries it out.
+			let at = blkno.get() * fs;
+			self.metadata_write_at(at, &buf[0..size])?;
+			return Ok(());
+		}
+
 		self.file.write_at(blkno.get() * fs, &buf[0..size])?;
 
 		// `buf[0..size]` is the whole allocated region for this logical block --
@@ -252,6 +296,10 @@ impl<R: Backend> Ufs<R> {
 		// contents have now reached the device, and any dependency waiting on
 		// that fact may advance.  Noting it here rather than at allocation time
 		// is the point: the allocation only *reserved* the block.
+		//
+		// A metadata block does not come through here, so its contents event
+		// comes from the flush loop instead, which is where its bytes actually
+		// go.
 		self.note_block_contents(blkno.get())?;
 		Ok(())
 	}

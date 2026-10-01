@@ -1586,3 +1586,176 @@ mod indirectptr {
 		let _ = BlockRole::Indirect { first: true };
 	}
 }
+
+/// Directory blocks are metadata, and this is where that stops being a claim.
+///
+/// Every directory path reaches its blocks through `inode_read_block` and
+/// `inode_write_block`, so the routing lives there rather than in `dir.rs`.
+/// These tests check both halves: that a directory block is a cached buffer
+/// that is dirty until a flush, and that a *file's* block still goes straight
+/// to the device. Getting only the first right would be the cylinder-group
+/// bitmap bug with extra steps.
+#[cfg(test)]
+mod dircache {
+	use super::*;
+	use crate::InodeNum;
+
+	fn create_file(ug: &mut Ufs<std::fs::File>, parent: InodeNum, name: &str) -> InodeNum {
+		ug.mknod(
+			parent,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// The cache block that holds the first data block of `inr`, whether the
+	/// inode is a file or a directory.
+	fn data_blk(ug: &mut Ufs<std::fs::File>, inr: InodeNum) -> (u64, u64) {
+		let ino = ug.read_inode(inr).unwrap();
+		let first = match &ino.data {
+			InodeData::Blocks(b) => b.direct[0] as u64,
+			_ => panic!("no block map"),
+		};
+		(ug.metadata_blk(first), first * ug.superblock.fsize())
+	}
+
+	/// A new directory's blocks are cached and stay dirty until a flush.
+	#[test]
+	fn a_new_directory_block_is_a_dirty_buffer() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-dc"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		let (blk, _) = data_blk(&mut ug, inr);
+		assert!(
+			ug.metadata_cache().is_resident(blk),
+			"the new directory's block is not in the cache"
+		);
+		assert!(ug.metadata_cache().dirty_count() > 0, "and it is not dirty");
+
+		// The image has not changed.
+		drop(ug);
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(
+			ug.dir_iter(inr, |_n, _i, _k| Some(())).is_err(),
+			"the directory was persisted without a flush"
+		);
+	}
+
+	/// The running filesystem sees an unflushed entry immediately.  This is the
+	/// reason the *live* image has to be read, not the disk: a lookup right
+	/// after a link would otherwise miss the file it just created.
+	#[test]
+	fn an_unflushed_entry_is_visible_to_the_running_filesystem() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-dv"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		let file = create_file(&mut ug, inr, "zzz-inside");
+		let found = ug
+			.dir_lookup(inr, OsStr::new("zzz-inside"))
+			.expect("the entry is visible before any flush");
+		assert_eq!(found, file);
+		assert!(ug.metadata_cache().dirty_count() > 0);
+
+		// And the directory's own `.` entry resolves to itself.
+		assert_eq!(
+			ug.dir_lookup(inr, OsStr::new(".")).unwrap(),
+			inr,
+			"the `.` entry is not visible"
+		);
+	}
+
+	/// After a flush the directory is on the disk and consistent.
+	#[test]
+	fn a_flushed_directory_survives_a_remount() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-df"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		let file = create_file(&mut ug, inr, "zzz-inner");
+		ug.sync_metadata().unwrap();
+		assert_eq!(ug.metadata_cache().dirty_count(), 0);
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert_eq!(ug.dir_lookup(inr, OsStr::new("zzz-inner")).unwrap(), file);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// A *file's* data block is not metadata and stays out of the cache.  This
+	/// is the separation the design rests on: if ordinary file data went through
+	/// here too, every FUSE page writeback would become an ordering question.
+	#[test]
+	fn a_files_data_block_is_not_cached() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create_file(&mut ug, InodeNum::ROOT, "zzz-file");
+		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
+		let (blk, _) = data_blk(&mut ug, inr);
+		assert!(
+			!ug.metadata_cache().is_resident(blk),
+			"file data reached the metadata cache"
+		);
+	}
+
+	/// Enlarging a directory past one filesystem block stages the new block and
+	/// leaves the old one alone, which is the case where a partial write would
+	/// be easiest to get wrong.
+	#[test]
+	fn extending_a_directory_stages_the_new_block() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-big"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		let (first_blk, _) = data_blk(&mut ug, inr);
+
+		// Enough entries to need a second filesystem block, without needing
+		// thousands of inodes: the golden image has very few free ones.  A
+		// `direntry` is `inr(4) + reclen(2) + kind(1) + namelen(1)` plus the
+		// name, rounded up to 4 bytes, so a 200-character name costs 208 and
+		// 200 of them overflow a 32 KiB block.
+		let pad = "x".repeat(200);
+		let names: Vec<String> = (0..200).map(|i| format!("zzz-{i}-{pad}")).collect();
+		for name in &names {
+			create_file(&mut ug, inr, name);
+		}
+		ug.sync_metadata().unwrap();
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.read_inode(inr).unwrap().size > ug.superblock.bsize());
+		assert!(ug.check_consistency().unwrap().is_clean());
+		for name in &names {
+			assert!(
+				ug.dir_lookup(inr, OsStr::new(name)).is_ok(),
+				"{name} did not survive"
+			);
+		}
+		let _ = first_blk;
+	}
+
+	/// A read-only mount still reads directories, and the cache never tries to
+	/// write one.
+	#[test]
+	fn a_read_only_mount_reads_directories() {
+		let (_img, mut ug) = testutil::open_ro("ufs-little");
+		let mut seen = 0u32;
+		ug.dir_iter::<u32>(InodeNum::ROOT, |_n, _i, _k| {
+			seen += 1;
+			None
+		})
+		.unwrap();
+		assert!(seen > 0, "the root directory is empty?");
+		ug.sync_metadata().unwrap();
+		assert_eq!(ug.metadata_cache().dirty_count(), 0);
+	}
+}
