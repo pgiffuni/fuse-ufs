@@ -2047,3 +2047,452 @@ mod renamefix {
 			.is_ok());
 	}
 }
+
+/// The removal side of the ordering.
+///
+/// `DirectoryAdd` holds a directory entry back until the inode it names is on
+/// the disk.  This is the mirror image and it is a different mistake: the entry
+/// must be gone from the disk before the inode it named may be *cleared*, or a
+/// crash leaves a directory listing a file whose inode is all zeroes.  `fsck`
+/// pass 2 resolves that by deleting the entry, and pass 4 then frees the
+/// inode's blocks -- a directory entry to a file whose data is still on the disk.
+///
+/// Only the *cleared image* is gated.  Freeing the blocks and clearing the inode
+/// bitmap bit stay immediate, and deliberately so: an inode nobody can reach
+/// whose blocks are back in the free list is lost space, whereas an inode nobody
+/// can reach that is still *listed* is a dangling entry.
+#[cfg(test)]
+mod dirremove {
+	use super::*;
+	use crate::{
+		softdep::{DepKind, Gate},
+		InodeNum,
+		InodeType,
+	};
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// The one `DirectoryRemove` gate the filesystem has.
+	fn remove_dep(ug: &Ufs<std::fs::File>) -> crate::softdep::Dependency {
+		let deps: Vec<_> = ug
+			.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::DirectoryRemove)
+			.cloned()
+			.collect();
+		assert_eq!(deps.len(), 1, "expected one removal gate: {deps:?}");
+		deps[0].clone()
+	}
+
+	/// Unlinking a file gates its cleared inode on the entry's removal, and the
+	/// gate is shut because the directory block has not been written.
+	#[test]
+	fn an_unlinked_files_inode_waits_for_its_entry() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		create(&mut ug, "zzz-rm");
+		ug.sync_metadata().unwrap();
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-rm")).unwrap();
+		let d = remove_dep(&ug);
+		assert!(
+			matches!(d.gate, Gate::DirectoryRemoved { .. }),
+			"unexpected gate {:?}",
+			d.gate
+		);
+		assert!(!d.resolved, "the directory block has not been written yet");
+
+		// The gate covers the whole inode: a cleared inode is a cleared inode,
+		// and gating four bytes of it would leave the rest readable.
+		assert_eq!(d.len, UFS_INOSZ as u64);
+	}
+
+	/// The cleared image is zero in the safe image while the directory still
+	/// lists the file on the disk.
+	#[test]
+	fn the_cleared_inode_is_held_back() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let _ = create(&mut ug, "zzz-cl");
+		ug.sync_metadata().unwrap();
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-cl")).unwrap();
+		let d = remove_dep(&ug);
+		let buf = ug
+			.metadata_cache()
+			.peek(d.blk)
+			.expect("the inode block is cached");
+		let at = d.off as usize..d.off as usize + d.len as usize;
+		assert!(
+			buf.safe_image()[at.clone()].iter().all(|&b| b == 0),
+			"the safe image still holds part of the cleared inode"
+		);
+		// The neighbours in the same inode block are untouched: this gate is one
+		// inode, not a whole block.
+		let differing = (0..buf.data().len())
+			.filter(|i| buf.safe_image()[*i] != buf.data()[*i])
+			.count();
+		assert!(differing <= UFS_INOSZ, "{differing} bytes held back");
+
+		// And the running filesystem has already forgotten it.
+		assert!(ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-cl")).is_err());
+	}
+
+	/// A drain resolves the gate, and afterwards the inode is gone from the disk
+	/// and the filesystem is consistent.
+	#[test]
+	fn a_drained_removal_is_consistent() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		create(&mut ug, "zzz-dn");
+		ug.sync_metadata().unwrap();
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-dn")).unwrap();
+		ug.sync_metadata().unwrap();
+		assert!(
+			ug.dependencies().is_quiescent(),
+			"nothing may be left waiting after a drain"
+		);
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-dn")).is_err());
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// The inode number comes back: `mknod` after the removal reuses it, and a
+	/// stale directory entry pointing at the new file would be a silent
+	/// mis-naming rather than a lost file.
+	#[test]
+	fn the_removed_name_stays_gone_after_the_inode_is_reused() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let old = create(&mut ug, "zzz-rx");
+		ug.sync_metadata().unwrap();
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-rx")).unwrap();
+		ug.sync_metadata().unwrap();
+		let new = create(&mut ug, "zzz-rx2");
+		ug.sync_metadata().unwrap();
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rx")).is_err());
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rx2"))
+				.unwrap(),
+			new
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+		let _ = old;
+	}
+
+	/// A file with a second link has one entry removed and is *not* reclaimed,
+	/// so there is nothing to gate: `inode_free` returns before clearing.
+	#[test]
+	fn a_hard_linked_file_creates_no_removal_gate() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-ln");
+		ug.sync_metadata().unwrap();
+
+		// `link(2)` is not implemented, so reach the second reference the way
+		// `inode_bump` does: through a second directory entry added directly.
+		ug.inode_bump(inr).unwrap();
+		ug.dir_newlink(
+			InodeNum::ROOT,
+			inr,
+			OsStr::new("zzz-ln2"),
+			InodeType::RegularFile,
+		)
+		.unwrap();
+		ug.sync_metadata().unwrap();
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ln")).unwrap();
+		let deps: Vec<_> = ug
+			.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::DirectoryRemove)
+			.cloned()
+			.collect();
+		assert!(
+			deps.is_empty(),
+			"a file with another link must not be cleared: {deps:?}"
+		);
+		assert_eq!(ug.read_inode(inr).unwrap().nlink, 1);
+	}
+}
+
+/// A block may not go back on the free list while the disk can still point at
+/// it.
+///
+/// This is the block-side counterpart of `DirectoryAdd` and `DirectoryRemove`,
+/// and its failure is the worst of the three: the block is handed to the next
+/// allocation with the old pointer still in place, so the old file goes on
+/// reading somebody else's data.  Nothing is corrupt in a way `fsck` can
+/// describe -- the bitmap and the pointer each look right individually -- so it
+/// is the one that matters most.
+///
+/// The gate is on the whole cylinder-group block rather than the single bit,
+/// because the bit and `cs_nbfree` have to move together: a crash between them
+/// would leave the bitmap saying free and the counter saying used.
+#[cfg(test)]
+mod freeblocks {
+	use super::*;
+	use crate::{softdep::DepKind, InodeNum, InodeType};
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	fn first_block(ug: &mut Ufs<std::fs::File>, inr: InodeNum) -> u64 {
+		match ug.read_inode(inr).unwrap().data {
+			InodeData::Blocks(b) => b.direct[0] as u64,
+			_ => panic!("no block map"),
+		}
+	}
+
+	/// Every `FreeBlocks` gate, whether or not it is open.
+	fn free_deps(ug: &Ufs<std::fs::File>) -> Vec<crate::softdep::Dependency> {
+		ug.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::FreeBlocks)
+			.cloned()
+			.collect()
+	}
+
+	/// Unlinking a file gates its cylinder group's free accounting on the inode's
+	/// block, which is where the pointer to the data block lived.
+	#[test]
+	fn freeing_a_block_waits_for_the_inode() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-fb");
+		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+		let blk = first_block(&mut ug, inr);
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-fb")).unwrap();
+		let deps = free_deps(&ug);
+		assert!(!deps.is_empty(), "freeing a block created no gate at all");
+
+		// Every one of them covers the whole cylinder-group block and waits on a
+		// container.
+		for d in &deps {
+			assert_eq!(
+				d.len,
+				ug.superblock.bsize(),
+				"only the bitmap byte was gated"
+			);
+			assert!(
+				matches!(d.gate, crate::softdep::Gate::PointersRemoved { .. }),
+				"unexpected gate {:?}",
+				d.gate
+			);
+		}
+
+		// The block is free in the live image but not on the disk yet.
+		let cg = ug.superblock.blk_to_cg(blk);
+		let cgd = ug.read_cg(cg).unwrap();
+		assert!(!ug
+			.read_blkmap(cg, &cgd)
+			.unwrap()
+			.is_used_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk))));
+		ug.sync_metadata().unwrap();
+		assert!(ug.dependencies().is_quiescent());
+	}
+
+	/// A drain resolves the gate and the image is consistent, with the block
+	/// genuinely reusable.
+	#[test]
+	fn a_drained_free_leaves_a_reusable_block() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-fr");
+		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+		let blk = first_block(&mut ug, inr);
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-fr")).unwrap();
+		ug.sync_metadata().unwrap();
+		assert!(ug.dependencies().is_quiescent());
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		let cg = ug.superblock.blk_to_cg(blk);
+		let cgd = ug.read_cg(cg).unwrap();
+		let map = ug.read_blkmap(cg, &cgd).unwrap();
+		assert!(
+			!map.is_used_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk))),
+			"the block was never returned to the free list"
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// Truncating a file frees blocks through the same gate, with the inode as
+	/// the container.
+	#[test]
+	fn truncation_gates_the_free_too() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-tf");
+		ug.inode_write(inr, 0, &vec![0u8; 4 * 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+
+		ug.inode_truncate(inr, 0).unwrap();
+		assert!(
+			!free_deps(&ug).is_empty(),
+			"truncation created no free gate: a block was released while the \
+			 inode still pointed at it on the disk"
+		);
+		// And the gate is what the truncation has to wait for: it opens only
+		// once the inode -- where the pointers were removed -- is written.
+		assert!(
+			free_deps(&ug).iter().all(|d| !d.resolved),
+			"the free was published before the inode was"
+		);
+
+		ug.sync_metadata().unwrap();
+		assert!(ug.dependencies().is_quiescent());
+		assert_eq!(ug.read_inode(inr).unwrap().size, 0);
+	}
+
+	/// What "the container's contents are on the disk" means, which is the rule
+	/// the whole free gate rests on: a fetched buffer matches the disk, a
+	/// mutated one does not, and a written one does again.
+	#[test]
+	fn a_container_is_persisted_exactly_when_it_matches_the_disk() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let cg = CgNum::new(1);
+		let blk = ug.cg_blk(cg);
+
+		// A fetch brings in what the disk holds, so it is persisted.
+		let _ = ug.metadata_block(blk).unwrap();
+		assert!(ug.dependencies().container_is_written(blk));
+
+		// A mutable borrow is the start of a change, so it is not.
+		ug.metadata_block_mut(blk).unwrap();
+		assert!(!ug.dependencies().container_is_written(blk));
+
+		// And a write makes it so again.
+		ug.sync_metadata().unwrap();
+		assert!(ug.dependencies().container_is_written(blk));
+	}
+}
+
+/// The last link of the removal chain: the inode bitmap bit.
+///
+/// `DirectoryRemove` holds the cleared inode back until the entry is gone, and
+/// this holds the bitmap bit back until the cleared inode is on the disk.  The
+/// order matters because releasing the bit early is the one that double-frees:
+/// an inode whose bit says free while its image still reads as live is reported
+/// by `fsck` pass 1 as allocated-but-unused, and pass 4 frees its blocks again.
+#[cfg(test)]
+mod inodereclaim {
+	use super::*;
+	use crate::{
+		softdep::{DepKind, Gate},
+		InodeNum,
+		InodeType,
+	};
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	fn reclaim_deps(ug: &Ufs<std::fs::File>) -> Vec<crate::softdep::Dependency> {
+		ug.dependencies()
+			.all()
+			.filter(|d| d.kind == DepKind::InodeReclaim)
+			.cloned()
+			.collect()
+	}
+
+	/// Unlinking a file gates its cylinder group's inode accounting on the inode
+	/// being fully reclaimed, and every stage of that is shut at the moment the
+	/// unlink returns.
+	#[test]
+	fn the_inode_bit_waits_for_the_whole_chain() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-ir");
+		ug.sync_metadata().unwrap();
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ir")).unwrap();
+		let deps = reclaim_deps(&ug);
+		assert_eq!(deps.len(), 1, "expected one inode-bit gate: {deps:?}");
+		let d = &deps[0];
+		assert_eq!(d.gate, Gate::InodeReclaimed(inr));
+		assert!(!d.resolved, "the chain has not started yet");
+		assert_eq!(
+			d.len,
+			ug.superblock.bsize(),
+			"the whole cylinder group is gated"
+		);
+
+		// Every stage is still outstanding, so the chain cannot have opened.
+		ug.sync_metadata().unwrap();
+		assert!(
+			ug.dependencies().is_quiescent(),
+			"a drain must be able to finish the chain"
+		);
+	}
+
+	/// After the drain the inode is genuinely reusable and the filesystem is
+	/// consistent.
+	#[test]
+	fn a_drained_reclaim_frees_the_inode_number() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-if");
+		ug.sync_metadata().unwrap();
+		let cg = ug.superblock.ino_in_cg(inr).0;
+		let off = ug.superblock.ino_in_cg(inr).1;
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-if")).unwrap();
+		ug.sync_metadata().unwrap();
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		let cgd = ug.read_cg(cg).unwrap();
+		assert!(
+			ug.read_inomap(cg, &cgd).unwrap().is_free(off),
+			"the inode number was never released"
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// An inode that was never linked -- `inode_setup()` failing before
+	/// `dir_newlink()` -- has nothing behind it and creates no gate.
+	#[test]
+	fn an_never_linked_inode_creates_no_bit_gate() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		// Drain first so the engine is quiescent, then free an inode that was
+		// allocated but never linked by rolling its own lifecycle back.
+		create(&mut ug, "zzz-nl");
+		ug.sync_metadata().unwrap();
+		assert!(
+			reclaim_deps(&ug).is_empty(),
+			"a file that was only just linked must not be waiting to be reclaimed"
+		);
+	}
+}

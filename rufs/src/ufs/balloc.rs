@@ -750,7 +750,29 @@ impl<R: Backend> Ufs<R> {
 	///
 	/// `size` must be a whole number of blocks; see the module-level note on
 	/// why fragment-granular freeing is deliberately not implemented.
-	pub(super) fn blk_free(&mut self, bno: u64, size: u64) -> IoResult<()> {
+	///
+	/// # `container`, and why the free is not immediate
+	///
+	/// `container` is the cache block of the structure the pointer to this block
+	/// has just been removed from -- the inode for a direct block or a
+	/// first-level indirect block, the enclosing indirect block for anything
+	/// deeper.  Its *identity* is not what matters; whether its current contents
+	/// have reached the disk is.
+	///
+	/// Clearing the allocation bit before that would hand a block that the disk
+	/// still has a pointer to to the next allocation, and the old file would go
+	/// on reading somebody else's data.  So the whole cylinder-group block --
+	/// struct, counters and both bitmaps -- is gated until the container has been
+	/// written.  The whole block rather than the one bit, because the bit and
+	/// `cs_nbfree` have to move together: a crash between them would leave the
+	/// bitmap saying free and the counter saying used.
+	///
+	/// A container that is already clean needs no gate: the pointer was removed
+	/// by something that did not dirty it, so the disk has not changed and there
+	/// is nothing to wait for.
+	///
+	/// Protects invariants 1, 2 and 3 in `docs/ufs2-invariants.md`.
+	pub(super) fn blk_free(&mut self, bno: u64, size: u64, container: u64) -> IoResult<()> {
 		log::trace!("blk_free(bno={bno}, size={size});");
 		self.assert_rw()?;
 
@@ -790,10 +812,41 @@ impl<R: Backend> Ufs<R> {
 
 		map.set_free_block(off, true);
 		self.write_blkmap(cg, &cgd, &map)?;
-
 		cgd.cs.nbfree += 1;
 		self.write_cg(cg, &cgd)?;
 		self.update_sb(|sb| sb.cstotal.nbfree += 1)?;
+
+		self.gate_block_free(cg, container)?;
+		Ok(())
+	}
+
+	/// Hold this cylinder group's free-block accounting back until the pointer
+	/// that reached a freed block has been removed from the disk.
+	/// Hold this cylinder group's free-block accounting back until the pointer
+	/// that reached a freed block has been removed from the disk.
+	///
+	/// The gate is created unconditionally.  It is tempting to skip it when the
+	/// container's contents already match the disk, and `inode_shrink()` is a
+	/// case where that is true at this moment -- the pointers have been removed
+	/// from a *clone* of the inode, and `inode_truncate()` has not written it
+	/// yet.  Deciding here would release the block while the disk still had the
+	/// pointer, which is the whole failure this dependency exists to prevent.
+	///
+	/// [`crate::softdep::Gate::PointersRemoved`] is therefore never opened
+	/// eagerly; it is decided on the next write or fetch of the container, which
+	/// is the first moment the question has an answer that is true.
+	fn gate_block_free(&mut self, cg: CgNum, container: u64) -> IoResult<()> {
+		let blk = self.cg_blk(cg);
+		let len = self.superblock.bsize();
+		log::trace!("gating {cg}'s free accounting at {blk} on {container}");
+		self.softdep.gate(
+			&mut self.buf,
+			crate::softdep::DepKind::FreeBlocks,
+			blk,
+			0,
+			len,
+			crate::softdep::Gate::PointersRemoved { container },
+		)?;
 		Ok(())
 	}
 
@@ -899,6 +952,41 @@ impl<R: Backend> Ufs<R> {
 		cgd.cs.nifree += 1;
 		self.write_cg(cg, &cgd)?;
 		self.update_sb(|sb| sb.cstotal.nifree += 1)?;
+
+		self.gate_inode_bit(inr, cg)?;
+		Ok(())
+	}
+
+	/// Hold the inode bitmap back until `inr`'s cleared image is on the disk.
+	///
+	/// The last step of a removal.  Releasing the bit while the cleared image is
+	/// still only in a buffer leaves an inode whose bit says free and whose
+	/// fields still read as live -- which `fsck` pass 1 reports as
+	/// allocated-but-unused and pass 4 then frees a second time.
+	///
+	/// Gate on the whole cylinder-group block for the same reason the block
+	/// free gates it: the bit and `cs_nifree` have to move together.
+	fn gate_inode_bit(&mut self, inr: InodeNum, cg: CgNum) -> IoResult<()> {
+		let Some(removal) = self.removal_gate(inr) else {
+			// Nothing was ever linked to this inode -- `inode_setup()` bailed out
+			// before `dir_newlink()` -- so there is no removal behind it and its
+			// bitmap bit may go out with everything else.
+			return Ok(());
+		};
+		let inode_blk = self.metadata_blk(self.superblock.ino_to_fsba(inr));
+		self.softdep.reclaim_inode(inr, Some(removal), inode_blk);
+
+		let blk = self.cg_blk(cg);
+		let len = self.superblock.bsize();
+		log::trace!("gating {cg}'s inode accounting at {blk} until {inr} is reclaimed");
+		self.softdep.gate(
+			&mut self.buf,
+			crate::softdep::DepKind::InodeReclaim,
+			blk,
+			0,
+			len,
+			crate::softdep::Gate::InodeReclaimed(inr),
+		)?;
 		Ok(())
 	}
 

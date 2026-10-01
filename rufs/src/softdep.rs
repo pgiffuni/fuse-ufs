@@ -67,7 +67,7 @@
 //! ordering each one enforces; they are *not* implemented here, and
 //! `docs/soft-updates.md` records that explicitly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 type IoResult<T> = std::io::Result<T>;
 
@@ -150,8 +150,52 @@ pub enum Gate {
 	InodeLinkCounted(InodeNum),
 	/// A directory block in the named parent has reached the device.
 	DirectoryPersisted { parent: InodeNum, blk: u64 },
-	/// The named inode is fully reclaimed.
+
+	/// The directory entry at that byte offset has been removed *persistently*.
+	///
+	/// "Persistently" is the whole word.  The entry's inode number is zeroed in
+	/// the live image the moment `dir_unlink()` runs, but the directory block
+	/// may not have reached the disk yet, and until it does the directory still
+	/// lists a file that is in the middle of being reclaimed.  The reclaim must
+	/// wait.
+	///
+	/// Resolved only when the block is written *fully*, because a safe
+	/// write-back leaves that block's other gated ranges behind and cannot be
+	/// said to have removed this entry.
+	DirectoryRemoved {
+		parent: InodeNum,
+		blk:    u64,
+		off:    u64,
+	},
+	/// The named inode's cleared image is on the disk.
+	///
+	/// The last transition of a removal:
+	///
+	/// ```text
+	///   directory entry removed   (Gate::DirectoryRemoved)
+	///        -> inode cleared     (gated on the above)
+	///        -> bitmap bit freed   (this gate)
+	/// ```
+	///
+	/// The bitmap bit is the *last* thing released because it is the one whose
+	/// early release is destructive: an inode whose bit says free while its
+	/// image still reads as live is one that `fsck` pass 1 reports as
+	/// allocated-but-unused and pass 4 then frees a second time.
 	InodeReclaimed(InodeNum),
+
+	/// Every pointer that used to reach a now-freed block has been removed from
+	/// the structures in `container`, and those structures have reached the
+	/// disk.
+	///
+	/// The block side of the ordering.  A block's allocation bit may not be
+	/// cleared while a pointer to it can still be found on the disk, because the
+	/// next allocation would hand the block to somebody else with the old
+	/// pointer still in place.
+	///
+	/// `container` is a cache block: the inode, for a direct block or for a
+	/// first-level indirect block, and the enclosing indirect block for
+	/// anything deeper.
+	PointersRemoved { container: u64 },
 }
 
 /// A gated byte range: "these bytes of that block may not be written until the
@@ -185,6 +229,15 @@ pub enum DepKind {
 	IndirectPointer,
 	/// A directory entry naming a newly initialised inode.
 	DirectoryAdd,
+	/// An inode that is being reclaimed, held back until the directory entry
+	/// that named it is gone from the disk.
+	DirectoryRemove,
+	/// A cylinder group's free-block accounting, held back until the structures
+	/// that pointed at the freed blocks are on the disk.
+	FreeBlocks,
+	/// An inode's bitmap entry, held back until the inode's cleared image is on
+	/// the disk.
+	InodeReclaim,
 }
 
 impl DepKind {
@@ -199,6 +252,16 @@ impl DepKind {
 				"inode_set_block(): the pointer table itself is created or grows"
 			}
 			Self::DirectoryAdd => "dir_newlink() after inode_alloc()",
+			Self::DirectoryRemove => {
+				"inode_free(): the last link has gone and the inode is being cleared"
+			}
+			Self::FreeBlocks => {
+				"blk_free(): a pointer to this block has just been removed from an inode \
+				 or an indirect block"
+			}
+			Self::InodeReclaim => {
+				"free_cg_inode(): this inode's last directory entry has just been removed"
+			}
 		}
 	}
 
@@ -215,6 +278,20 @@ impl DepKind {
 			}
 			Self::DirectoryAdd => {
 				"a directory entry must not reach the disk before the inode it names is on disk"
+			}
+			Self::DirectoryRemove => {
+				"a cleared inode must not reach the disk before the directory entry that \
+				 named it is gone"
+			}
+			Self::FreeBlocks => {
+				"a block is returned to the free list while the disk still holds a pointer \
+				 to it; the next allocation hands it to somebody else and the old file \
+				 keeps reading somebody else's data"
+			}
+			Self::InodeReclaim => {
+				"an inode's bitmap bit must not reach the disk before its cleared image, \
+				 and the cleared image must not reach it before the directory entry that \
+				 named it is gone"
 			}
 		}
 	}
@@ -237,6 +314,21 @@ impl DepKind {
 				 are zero; fsck_ffs pass 2 clears the entry, and the file's data is lost even \
 				 though it is on the disk"
 			}
+			Self::DirectoryRemove => {
+				"a directory entry names an inode whose fields are zero and whose bitmap bit is \
+				 still set; fsck_ffs pass 2 clears the entry, and pass 4 then frees the inode's \
+				 blocks -- a directory entry to a file whose data is still on the disk"
+			}
+			Self::FreeBlocks => {
+				"a block is returned to the free list while the disk still holds a \
+				 pointer to it; the next allocation hands it to somebody else and the \
+				 old file keeps reading somebody else's data"
+			}
+			Self::InodeReclaim => {
+				"an inode's bitmap bit says free while its image still reads as live; \
+				 fsck_ffs pass 1 reports it as allocated but unused and pass 4 then \
+				 frees its blocks a second time"
+			}
 		}
 	}
 
@@ -248,6 +340,9 @@ impl DepKind {
 				"the NewBlockDep for the target block, and then the inode's write"
 			}
 			Self::DirectoryAdd => "the inode's write reaching the device",
+			Self::DirectoryRemove => "the directory block being written in full",
+			Self::FreeBlocks => "the inode or indirect block the pointer was removed from",
+			Self::InodeReclaim => "the cleared inode image, and the directory entry before it",
 		}
 	}
 
@@ -257,6 +352,9 @@ impl DepKind {
 			Self::DirectPointer => "invariants 2, 3 and 4 (docs/ufs2-invariants.md)",
 			Self::IndirectPointer => "invariants 3 and 7",
 			Self::DirectoryAdd => "invariants 5 and 6",
+			Self::DirectoryRemove => "invariants 1 and 6",
+			Self::FreeBlocks => "invariants 1, 2 and 3",
+			Self::InodeReclaim => "invariants 1 and 7",
 		}
 	}
 }
@@ -421,6 +519,146 @@ impl InodeDep {
 	}
 }
 
+/// A directory entry that has been removed from the live image and is waiting to
+/// reach the disk.
+///
+/// The counterpart of [`NewBlockDep`] on the removal side: `dir_unlink()` zeroes
+/// the entry's inode number immediately, so the live directory no longer lists
+/// the file while the disk may still do.  Anything that reclaims the inode has
+/// to wait until the disk agrees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryRemoveDep {
+	blk:  u64,
+	off:  u64,
+	gone: bool,
+}
+
+impl DirectoryRemoveDep {
+	/// Whether the directory entry is known to be gone from the disk.
+	pub fn is_persisted(&self) -> bool {
+		self.gone
+	}
+}
+
+impl DependencyEngine {
+	/// Record a directory entry as removed from the live image.
+	///
+	/// Created by `Ufs::dir_unlink()`, once it has zeroed the entry's inode
+	/// number.  Protects invariants 1 and 6 in `docs/ufs2-invariants.md`.
+	pub fn directory_removed(&mut self, parent: InodeNum, blk: u64, off: u64, inr: InodeNum) {
+		let gate = Gate::DirectoryRemoved { parent, blk, off };
+		self.removals.insert(
+			gate,
+			DirectoryRemoveDep {
+				blk,
+				off,
+				gone: false,
+			},
+		);
+		self.by_removed_inode.insert(inr, gate);
+	}
+
+	/// Record that the directory block `blk` has been written *in full*, which
+	/// is what makes every removal in it persistent.
+	///
+	/// Keyed by block rather than by parent because the flush loop knows which
+	/// block it wrote and not which directory owns it: the parent is part of the
+	/// gate, so two directories can never be confused for one another, but it is
+	/// not what the caller has.  Removals outstanding between two flushes are
+	/// few, so the scan is not worth an index.
+	pub fn note_directory_block_written(&mut self, blk: u64) -> usize {
+		let mut gone = Vec::new();
+		for (gate, dep) in &mut self.removals {
+			if dep.blk == blk && !dep.gone {
+				dep.gone = true;
+				gone.push(*gate);
+			}
+		}
+		let n = gone.len();
+		for gate in gone {
+			self.settle_removal(&gate);
+		}
+		n
+	}
+
+	/// The gate that opens when the most recent removal of `inr` is persistent.
+	///
+	/// Keyed by inode rather than by block, because the reclaiming path has an
+	/// inode and not a directory.  The *newest* removal is the one that matters:
+	/// a file renamed within one operation has had more than one entry removed,
+	/// and only the last one is still live.
+	pub fn removal_gate(&self, inr: InodeNum) -> Option<Gate> {
+		self.by_removed_inode
+			.get(&inr)
+			.and_then(|gate| self.removals.get(gate).map(|_| *gate))
+	}
+
+	/// Record whether `blk`'s cached contents currently match the disk.
+	///
+	/// This is *not* "has been written at some point": a buffer that was
+	/// written and then modified again is back to not matching, and a pointer
+	/// removed after that write is not persistent.  `Ufs` keeps it honest from
+	/// the two places it can go stale -- a fetch, which brings in what the disk
+	/// holds, and a mutable borrow, which is the start of a change.
+	pub fn set_container_persisted(&mut self, blk: u64, persisted: bool) {
+		if persisted {
+			self.written.insert(blk);
+		} else {
+			self.written.remove(&blk);
+		}
+		if persisted {
+			self.settle_removal(&Gate::PointersRemoved { container: blk });
+			// An inode whose cleared image has just reached the disk may have its
+			// bitmap bit released, if the removal it waited on also happened.
+			for inr in self.reclaimants_of(blk) {
+				let gate = Gate::InodeReclaimed(inr);
+				if self.gate_is_open(gate) {
+					self.settle_removal(&gate);
+				}
+			}
+		}
+	}
+
+	/// Declare that `inr` is being reclaimed.
+	///
+	/// `removal` is the gate the directory entry's removal waits on, and
+	/// `inode_blk` the cache block its cleared image lives in.  `None` for an
+	/// inode that was never linked, which has nothing behind it.
+	pub fn reclaim_inode(&mut self, inr: InodeNum, removal: Option<Gate>, inode_blk: u64) {
+		let Some(removal) = removal else {
+			return;
+		};
+		self.reclaiming.insert(inr, (removal, inode_blk));
+	}
+
+	fn reclaimants_of(&self, inode_blk: u64) -> Vec<InodeNum> {
+		self.reclaiming
+			.iter()
+			.filter(|(_, (_, blk))| *blk == inode_blk)
+			.map(|(inr, _)| *inr)
+			.collect()
+	}
+
+	/// Whether `container`'s current contents are on the disk.
+	pub fn container_is_written(&self, container: u64) -> bool {
+		self.written.contains(&container)
+	}
+
+	fn settle_removal(&mut self, gate: &Gate) {
+		if !self.gate_is_open(*gate) {
+			return;
+		}
+		if let Some(ids) = self.waiting_on.remove(gate) {
+			for id in ids {
+				if self.deps.get(&id).is_some_and(|d| d.resolved) {
+					continue;
+				}
+				self.publish_dep(id);
+			}
+		}
+	}
+}
+
 /// The write-ordering engine.
 #[derive(Debug, Default)]
 pub struct DependencyEngine {
@@ -430,6 +668,26 @@ pub struct DependencyEngine {
 	/// `InodeDep`s indexed by the inode they are about.
 	inodes:   BTreeMap<DepId, InodeDep>,
 	by_inode: BTreeMap<InodeNum, DepId>,
+
+	/// Directory entries removed from the live image, waiting for the disk.
+	removals: BTreeMap<Gate, DirectoryRemoveDep>,
+
+	/// Inodes being reclaimed, with the removal each waits on and the cache
+	/// block its cleared image lives in.
+	reclaiming: BTreeMap<InodeNum, (Gate, u64)>,
+
+	/// The newest removal for each removed inode.
+	by_removed_inode: BTreeMap<InodeNum, Gate>,
+
+	/// Buffers that have been written since this filesystem was opened, and so
+	/// whose contents are on the disk.
+	///
+	/// This is what makes `Gate::PointersRemoved` decidable without a separate
+	/// record per removal: "the pointer has been removed persistently" reduces to
+	/// "that buffer has been written", because removing a pointer is an ordinary
+	/// ungated change.  It is a set rather than a flag per gate because several
+	/// frees can be waiting on the same container.
+	written: BTreeSet<u64>,
 
 	/// `NewBlockDep`s indexed by the block they are about.
 	///
@@ -464,7 +722,11 @@ impl DependencyEngine {
 
 	/// Whether nothing is outstanding.
 	pub fn is_empty(&self) -> bool {
-		self.deps.is_empty() && self.new_blocks.is_empty() && self.inodes.is_empty()
+		self.deps.is_empty() &&
+			self.new_blocks.is_empty() &&
+			self.inodes.is_empty() &&
+			self.removals.is_empty() &&
+			self.reclaiming.is_empty()
 	}
 
 	/// Register a newly allocated block.
@@ -674,7 +936,16 @@ impl DependencyEngine {
 		);
 		// A gate whose precondition already holds must open immediately, or the
 		// range would stay unpublished forever.
-		if self.gate_is_open(gate) {
+		//
+		// `Gate::PointersRemoved` is the exception, and deliberately so.  "The
+		// container's contents are on the disk" is true at the moment the gate is
+		// created -- the pointer removal has not been staged yet -- and becomes
+		// false again a moment later, when it is.  Deciding here would open the
+		// gate and publish the freed block's accounting before the removal it is
+		// waiting for had happened.  It is decided on the *next* write or fetch of
+		// that container instead, which is the first moment the answer is true.
+		let eager = !matches!(gate, Gate::PointersRemoved { .. }) && self.gate_is_open(gate);
+		if eager {
 			self.publish_dep(id);
 		} else {
 			self.waiting_on.entry(gate).or_default().push(id);
@@ -754,7 +1025,11 @@ impl DependencyEngine {
 			self.new_blocks
 				.values()
 				.all(NewBlockDep::allows_publication) &&
-			self.inodes.values().all(InodeDep::allows_naming)
+			self.inodes.values().all(InodeDep::allows_naming) &&
+			self.removals.values().all(DirectoryRemoveDep::is_persisted) &&
+			self.reclaiming
+				.keys()
+				.all(|i| self.gate_is_open(Gate::InodeReclaimed(*i)))
 	}
 
 	fn alloc_id(&mut self) -> DepId {
@@ -778,9 +1053,23 @@ impl DependencyEngine {
 					.and_then(|id| self.inodes.get(id))
 					.is_some_and(InodeDep::allows_naming)
 			}
-			Gate::InodeLinkCounted(_) |
-			Gate::DirectoryPersisted { .. } |
-			Gate::InodeReclaimed(_) => false,
+			Gate::DirectoryRemoved { parent, blk, off } => {
+				self.removals
+					.get(&Gate::DirectoryRemoved { parent, blk, off })
+					.is_some_and(DirectoryRemoveDep::is_persisted)
+			}
+			Gate::PointersRemoved { container } => self.written.contains(&container),
+			// An inode nobody is reclaiming has no transition to wait for, and a
+			// gate on one is never created in the first place; the safe answer
+			// here is "shut", so that a gate created without a reclamation behind
+			// it cannot publish anything on its own.
+			Gate::InodeReclaimed(inr) => {
+				self.reclaiming.get(&inr).is_some_and(|(removal, blk)| {
+					// The entry is gone *and* the cleared image is on the disk.
+					self.gate_is_open(*removal) && self.written.contains(blk)
+				})
+			}
+			Gate::InodeLinkCounted(_) | Gate::DirectoryPersisted { .. } => false,
 		}
 	}
 }

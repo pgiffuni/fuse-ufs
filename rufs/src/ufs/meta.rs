@@ -142,7 +142,13 @@ impl<R: Backend> Ufs<R> {
 	/// holding back.
 	pub(super) fn metadata_block(&mut self, blk: u64) -> IoResult<&[u8]> {
 		let Self { file, buf, .. } = self;
-		buf.get(file, blk)
+		buf.get(file, blk)?;
+		let b = buf.peek(blk).expect("just fetched");
+		// A buffer that is not dirty was last written in full, so its contents
+		// are the disk's.  That is what "a pointer in it is persistently gone"
+		// means, and `DependencyEngine` needs to be told.
+		self.softdep.set_container_persisted(blk, !b.is_dirty());
+		Ok(b.data())
 	}
 
 	/// Mutable view of the cached metadata block `blk`, marked dirty.
@@ -152,7 +158,11 @@ impl<R: Backend> Ufs<R> {
 	/// whereas a caller that mutates without marking dirty would lose data.
 	pub(super) fn metadata_block_mut(&mut self, blk: u64) -> IoResult<&mut Buffer> {
 		let Self { file, buf, .. } = self;
-		buf.get_mut(file, blk)
+		let out = buf.get_mut(file, blk);
+		// Handing out a mutable buffer is the start of a change, so whatever the
+		// disk holds is about to stop being true.
+		self.softdep.set_container_persisted(blk, false);
+		out
 	}
 
 	/// Copy `bytes` into the cached metadata block `blk` at `off`, dirtying it.
@@ -257,10 +267,9 @@ impl<R: Backend> Ufs<R> {
 
 	/// The metadata buffer cache.
 	///
-	/// Test-only, deliberately.  The FUSE backend must not be able to reach in
-	/// here: deciding what gets persisted is `Ufs`'s job, and an accessor that
-	/// a callback could use to force a write would quietly undo the whole
-	/// architecture.
+	/// Test-only.  Deciding what gets persisted is `Ufs`'s job, and an accessor a
+	/// FUSE callback could use to force a write would quietly undo the
+	/// architecture that makes the callback unnecessary.
 	#[cfg(test)]
 	pub(super) fn metadata_cache(&self) -> &BufferCache {
 		&self.buf
@@ -278,8 +287,8 @@ impl<R: Backend> Ufs<R> {
 	/// The Soft Updates dependency graph.
 	///
 	/// Test-only, for the same reason as [`Self::metadata_cache`]: ordering is
-	/// decided here and nowhere else, so a caller that could inspect or advance
-	/// the graph would be able to publish a range nothing has justified.
+	/// decided here and nowhere else, so a caller that could advance the graph
+	/// would be able to publish a range nothing has justified.
 	#[cfg(test)]
 	pub(super) fn dependencies(&self) -> &DependencyEngine {
 		&self.softdep
@@ -371,6 +380,14 @@ impl<R: Backend> Ufs<R> {
 	fn note_block_written(&mut self, blk: u64, how: Written) -> IoResult<()> {
 		let full = how == Written::Full;
 
+		// A write makes the buffer's contents what the disk holds again, whether
+		// it was a safe or a full one: removing a pointer is an ordinary ungated
+		// change, and a safe write persists it along with everything else that is
+		// not gated.  The events that must *not* be told early -- a directory
+		// removal, whose block may have other gated ranges behind it -- are the
+		// ones that check `full` separately below.
+		self.softdep.set_container_persisted(blk, true);
+
 		// Block dependencies: the bitmap belongs to a cylinder group and is
 		// never gated, so any write persists it; the contents are the live
 		// image, so only a full write persisted them.
@@ -426,12 +443,54 @@ impl<R: Backend> Ufs<R> {
 			log::trace!("note_block_written({blk}): inode image for {id:?}");
 			self.softdep.note_inode_written(id)?;
 		}
+
+		// A directory removal is persistent once its block has been written *in
+		// full*.  A safe write-back leaves the block's other gated ranges behind,
+		// so it cannot be said to have removed this entry -- and saying so would
+		// let an inode be cleared while the disk still lists it.
+		if full {
+			let n = self.softdep.note_directory_block_written(blk);
+			if n > 0 {
+				log::trace!("note_block_written({blk}): {n} removal(s) persisted");
+			}
+		}
 		Ok(())
 	}
 
 	/// The cache block holding `inr`'s inode.
 	fn inode_blk(&self, inr: InodeNum) -> u64 {
 		self.metadata_blk(self.superblock.ino_to_fsba(inr))
+	}
+
+	/// The gate that opens when the last directory entry naming `inr` is gone
+	/// from the disk, if one has been removed since the last flush.
+	///
+	/// `None` for an inode that was never linked, or whose removal is already
+	/// persistent -- in which case there is nothing to wait for and the cleared
+	/// image may go out as ordinary dirty metadata.
+	pub(super) fn removal_gate(&mut self, inr: InodeNum) -> Option<crate::softdep::Gate> {
+		self.softdep.removal_gate(inr)
+	}
+
+	/// Record that the directory entry at `block_off` in `dinr` has been
+	/// removed from the live image.
+	///
+	/// The entry is already gone as far as the running filesystem is concerned.
+	/// What this records is that the *disk* does not know yet, which is what the
+	/// inode's reclamation has to wait for.
+	pub(super) fn note_dirent_removed(
+		&mut self,
+		dinr: InodeNum,
+		pos: u64,
+		block_off: u64,
+		inr: InodeNum,
+	) -> IoResult<()> {
+		let Some(blk) = self.dirent_block(dinr, pos + block_off)? else {
+			return Ok(());
+		};
+		self.softdep.directory_removed(dinr, blk, block_off, inr);
+		log::trace!("directory entry for {inr} removed at {dinr}'s block {blk}:{block_off}");
+		Ok(())
 	}
 }
 

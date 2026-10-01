@@ -255,10 +255,24 @@ impl<R: Backend> Ufs<R> {
 		(at / bs, at % bs + idx * size_of::<UfsDaddr>() as u64)
 	}
 
-	fn inode_free_l1(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
+	/// Free the sub-tree behind a first-level indirect block.
+	///
+	/// `inode_blk` is the cache block holding the inode, which is the container
+	/// for `bno` itself.  Entries inside `bno` have `bno` as their container,
+	/// which is exactly the chain the ordering rule asks for: a child is
+	/// released only after the indirect block that named it is on the disk, and
+	/// the indirect block is released only after the inode is.
+	fn inode_free_l1(
+		&mut self,
+		ino: &mut Inode,
+		bno: u64,
+		block: &mut [u64],
+		inode_blk: u64,
+	) -> IoResult<()> {
 		if bno == 0 {
 			return Ok(());
 		}
+		let l1_blk = self.metadata_blk(bno);
 
 		self.read_pblock(bno, block)?;
 
@@ -277,17 +291,17 @@ impl<R: Backend> Ufs<R> {
 			let lbn = self.inode_l1_offset(ino, idx as u64);
 			if lbn < end {
 				let size = self.inode_get_block_size(ino, lbn);
-				self.inode_free_block(ino, *bno, size as u64)?;
+				self.inode_free_block(ino, *bno, size as u64, l1_blk)?;
 			} else {
 				log::warn!(
 					"inode_free_l1: indirect block holds a pointer at lbn {lbn}, \
 					 past the end of the file ({end} blocks); freeing it whole"
 				);
-				self.inode_free_block(ino, *bno, self.superblock.bsize())?;
+				self.inode_free_block(ino, *bno, self.superblock.bsize(), l1_blk)?;
 			}
 		}
 
-		self.blk_free(bno, self.superblock.bsize as u64)?;
+		self.blk_free(bno, self.superblock.bsize as u64, inode_blk)?;
 
 		Ok(())
 	}
@@ -297,36 +311,50 @@ impl<R: Backend> Ufs<R> {
 		UFS_NDADDR as u64 + idx
 	}
 
-	fn inode_free_l2(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
+	fn inode_free_l2(
+		&mut self,
+		ino: &mut Inode,
+		bno: u64,
+		block: &mut [u64],
+		inode_blk: u64,
+	) -> IoResult<()> {
 		if bno == 0 {
 			return Ok(());
 		}
+		let l2_blk = self.metadata_blk(bno);
 
 		self.read_pblock(bno, block)?;
 		let indir = block.to_owned();
 
 		for bno in indir {
-			self.inode_free_l1(ino, bno, block)?;
+			self.inode_free_l1(ino, bno, block, l2_blk)?;
 		}
 
-		self.blk_free(bno, self.superblock.bsize as u64)?;
+		self.blk_free(bno, self.superblock.bsize as u64, inode_blk)?;
 
 		Ok(())
 	}
 
-	fn inode_free_l3(&mut self, ino: &mut Inode, bno: u64, block: &mut [u64]) -> IoResult<()> {
+	fn inode_free_l3(
+		&mut self,
+		ino: &mut Inode,
+		bno: u64,
+		block: &mut [u64],
+		inode_blk: u64,
+	) -> IoResult<()> {
 		if bno == 0 {
 			return Ok(());
 		}
+		let l3_blk = self.metadata_blk(bno);
 
 		self.read_pblock(bno, block)?;
 		let indir = block.to_owned();
 
 		for bno in indir {
-			self.inode_free_l2(ino, bno, block)?;
+			self.inode_free_l2(ino, bno, block, l3_blk)?;
 		}
 
-		self.blk_free(bno, self.superblock.bsize as u64)?;
+		self.blk_free(bno, self.superblock.bsize as u64, inode_blk)?;
 
 		Ok(())
 	}
@@ -362,6 +390,10 @@ impl<R: Backend> Ufs<R> {
 		if let InodeData::Blocks(blocks) = ino.data.clone() {
 			let bs = self.superblock.bsize as u64;
 			let mut block = vec![0u64; bs as usize / size_of::<u64>()];
+			// Every pointer being removed here lives in the inode, so the inode's
+			// block is the container for all of them -- the direct blocks and the
+			// three indirect blocks alike.
+			let inode_blk = self.metadata_blk(self.superblock.ino_to_fsba(inr));
 
 			for i in 0..UFS_NDADDR {
 				let bno = blocks.direct[i] as u64;
@@ -369,12 +401,12 @@ impl<R: Backend> Ufs<R> {
 					continue;
 				}
 				let size = self.inode_get_block_size(&ino, i as u64);
-				self.inode_free_block(&mut ino, bno, size as u64)?;
+				self.inode_free_block(&mut ino, bno, size as u64, inode_blk)?;
 			}
 
-			self.inode_free_l1(&mut ino, blocks.indirect[0] as u64, &mut block)?;
-			self.inode_free_l2(&mut ino, blocks.indirect[1] as u64, &mut block)?;
-			self.inode_free_l3(&mut ino, blocks.indirect[2] as u64, &mut block)?;
+			self.inode_free_l1(&mut ino, blocks.indirect[0] as u64, &mut block, inode_blk)?;
+			self.inode_free_l2(&mut ino, blocks.indirect[1] as u64, &mut block, inode_blk)?;
+			self.inode_free_l3(&mut ino, blocks.indirect[2] as u64, &mut block, inode_blk)?;
 		}
 
 		// Now the inode itself.  `i_blocks` goes to zero first so that a crash
@@ -389,6 +421,36 @@ impl<R: Backend> Ufs<R> {
 		// device write that lands immediately.
 		self.metadata_fill_at(off, 0u8, UFS_INOSZ)?;
 
+		// ...and it is held back until the directory entry that named this
+		// inode is *persistently* gone.
+		//
+		// Without this, a crash between the two leaves a directory listing a
+		// file whose inode is all zeroes: `fsck` pass 2 resolves that by clearing
+		// the entry, and pass 4 then frees the inode's blocks -- a directory
+		// entry to a file whose data is still sitting on the disk.  Zeroing an
+		// inode before its last name disappears is the removal-side twin of
+		// letting an entry appear before the inode does.
+		//
+		// The gate is on the *cleared image* rather than on the operations after
+		// it, because that is what the byte-range model can express.  Freeing the
+		// blocks and clearing the inode bitmap bit stay immediate; both are safe
+		// on their own, because an inode nobody can reach whose blocks have been
+		// returned to the free list is lost space, whereas an inode nobody can
+		// reach that is still *listed* is a dangling entry.  That asymmetry is
+		// the same one the comment above `inode_free`'s block walk relies on.
+		if let Some(gate) = self.removal_gate(inr) {
+			let blk = self.metadata_blk(self.superblock.ino_to_fsba(inr));
+			log::trace!("gating the cleared image of {inr} at {blk}");
+			self.softdep.gate(
+				&mut self.buf,
+				crate::softdep::DepKind::DirectoryRemove,
+				blk,
+				off % self.superblock.bsize(),
+				UFS_INOSZ as u64,
+				gate,
+			)?;
+		}
+
 		self.free_cg_inode(inr)?;
 		if is_dir {
 			self.free_cg_dir(inr)?;
@@ -397,7 +459,13 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
-	fn inode_shrink(&mut self, ino: &mut Inode, new_size: u64) -> IoResult<()> {
+	/// Remove every block past `new_size`.
+	///
+	/// The inode's own block is the container for every pointer removed from the
+	/// inode itself; deeper containers are the indirect blocks, computed where
+	/// the entry was removed.
+	fn inode_shrink(&mut self, inr: InodeNum, ino: &mut Inode, new_size: u64) -> IoResult<()> {
+		let inode_blk = self.metadata_blk(self.superblock.ino_to_fsba(inr));
 		let (begin_indir1, begin_indir2, begin_indir3, _) = self.inode_data_zones();
 		let sb = &self.superblock;
 		let bs = sb.bsize();
@@ -433,19 +501,22 @@ impl<R: Backend> Ufs<R> {
 				}
 				let size = self
 					.inode_get_block_size(ino, begin_indir3 + off3 * pbp * pbp + off2 * pbp + i);
-				self.inode_free_block(ino, bno, size as u64)?;
+				let snd_blk = self.metadata_blk(snd[off2 as usize]);
+				self.inode_free_block(ino, bno, size as u64, snd_blk)?;
 			}
 			self.write_pblock(snd[off2 as usize], &block)?;
+			let snd_blk = self.metadata_blk(snd[off2 as usize]);
 			for i in (off2 + 1)..pbp {
 				let bno = replace(&mut snd[i as usize], 0);
-				self.inode_free_l1(ino, bno, &mut block)?;
+				self.inode_free_l1(ino, bno, &mut block, snd_blk)?;
 			}
+			let fst_blk = self.metadata_blk(fst[off1 as usize]);
 			self.write_pblock(fst[off1 as usize], &snd)?;
 
 			// the remaining tables can be freed completely
 			for i in (off1 + 1)..pbp {
 				let bno = replace(&mut fst[i as usize], 0);
-				self.inode_free_l2(ino, bno, &mut block)?;
+				self.inode_free_l2(ino, bno, &mut block, fst_blk)?;
 			}
 
 			self.write_pblock(iblocks.indirect[2] as u64, &block)?;
@@ -453,7 +524,12 @@ impl<R: Backend> Ufs<R> {
 			return Ok(());
 		}
 
-		self.inode_free_l3(ino, replace(&mut iblocks.indirect[2], 0) as u64, &mut block)?;
+		self.inode_free_l3(
+			ino,
+			replace(&mut iblocks.indirect[2], 0) as u64,
+			&mut block,
+			inode_blk,
+		)?;
 
 		if blocks >= begin_indir2 {
 			let used = blocks - begin_indir2;
@@ -471,14 +547,16 @@ impl<R: Backend> Ufs<R> {
 					continue;
 				}
 				let size = self.inode_get_block_size(ino, begin_indir2 + off2 * pbp + i);
-				self.inode_free_block(ino, bno, size as u64)?;
+				let fst_blk = self.metadata_blk(fst[off1 as usize]);
+				self.inode_free_block(ino, bno, size as u64, fst_blk)?;
 			}
 			self.write_pblock(fst[off1 as usize], &block)?;
 
 			// the remaining tables can be freed completely
+			let fst_blk = self.metadata_blk(fst[off1 as usize]);
 			for i in (off1 + 1)..pbp {
 				let bno = replace(&mut fst[i as usize], 0);
-				self.inode_free_l1(ino, bno, &mut block)?;
+				self.inode_free_l1(ino, bno, &mut block, fst_blk)?;
 			}
 
 			self.write_pblock(iblocks.indirect[1] as u64, &fst)?;
@@ -486,7 +564,12 @@ impl<R: Backend> Ufs<R> {
 			return Ok(());
 		}
 
-		self.inode_free_l2(ino, replace(&mut iblocks.indirect[1], 0) as u64, &mut block)?;
+		self.inode_free_l2(
+			ino,
+			replace(&mut iblocks.indirect[1], 0) as u64,
+			&mut block,
+			inode_blk,
+		)?;
 
 		if blocks >= begin_indir1 {
 			let used = blocks - begin_indir1;
@@ -498,7 +581,8 @@ impl<R: Backend> Ufs<R> {
 					continue;
 				}
 				let size = self.inode_get_block_size(ino, begin_indir1 + i);
-				self.inode_free_block(ino, bno, size as u64)?;
+				let l1_blk = self.metadata_blk(iblocks.indirect[0] as u64);
+				self.inode_free_block(ino, bno, size as u64, l1_blk)?;
 			}
 
 			self.write_pblock(iblocks.indirect[0] as u64, &block)?;
@@ -507,7 +591,12 @@ impl<R: Backend> Ufs<R> {
 			return Ok(());
 		}
 
-		self.inode_free_l1(ino, replace(&mut iblocks.indirect[0], 0) as u64, &mut block)?;
+		self.inode_free_l1(
+			ino,
+			replace(&mut iblocks.indirect[0], 0) as u64,
+			&mut block,
+			inode_blk,
+		)?;
 
 		for i in (blocks as usize)..UFS_NDADDR {
 			let bno = replace(&mut iblocks.direct[i], 0) as u64;
@@ -515,7 +604,7 @@ impl<R: Backend> Ufs<R> {
 				continue;
 			}
 			let size = self.inode_get_block_size(ino, i as u64);
-			self.inode_free_block(ino, bno, size as u64)?;
+			self.inode_free_block(ino, bno, size as u64, inode_blk)?;
 		}
 
 		ino.data = InodeData::Blocks(iblocks);
@@ -530,7 +619,7 @@ impl<R: Backend> Ufs<R> {
 		let old_size = ino.size;
 
 		if new_size < old_size {
-			self.inode_shrink(&mut ino, new_size)?;
+			self.inode_shrink(inr, &mut ino, new_size)?;
 		}
 
 		ino.size = new_size;
@@ -836,12 +925,24 @@ impl<R: Backend> Ufs<R> {
 		Ok((block, block_size))
 	}
 
-	fn inode_free_block(&mut self, ino: &mut Inode, bno: u64, _size: u64) -> IoResult<()> {
+	/// Free one block of `ino`, whose pointer has just been removed.
+	///
+	/// `container` is the cache block the pointer lived in: the inode for a
+	/// direct block, the enclosing indirect block for an indirect entry.  It is
+	/// what `blk_free` waits for before releasing the allocation bit, because
+	/// until it is on the disk something can still point at the block.
+	fn inode_free_block(
+		&mut self,
+		ino: &mut Inode,
+		bno: u64,
+		_size: u64,
+		container: u64,
+	) -> IoResult<()> {
 		// Allocation always takes a whole block (see the module docs of
 		// `balloc`), so freeing must as well; `size` is kept in the signature
 		// to document the caller's intent and to be used once fragment
 		// allocation lands.
-		self.blk_free(bno, self.superblock.bsize as u64)?;
+		self.blk_free(bno, self.superblock.bsize as u64, container)?;
 		log::trace!("inode_free_block({bno}): old_blocks={}", ino.blocks);
 		// Saturate rather than wrap: a block found outside the inode's size
 		// (see `inode_free_l1`) was never charged to `i_blocks`, and

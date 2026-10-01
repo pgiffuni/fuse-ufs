@@ -183,12 +183,19 @@ fn newlink_block(block: &mut [u8], mut entry: Header, config: Config) -> IoResul
 	Ok(None)
 }
 
+/// Remove the entry naming `name` from a directory block.
+///
+/// Returns the inode it named, whether the record could be reclaimed (`has`),
+/// and the offset the removed record occupied.  The offset is what
+/// `dir_unlink()` needs to tell the dependency engine *where* the entry was, and
+/// it cannot be found afterwards: a removed record parses as end-of-directory,
+/// so a second scan would stop at it and never reach the one being asked about.
 fn unlink_block(
 	dinr: InodeNum,
 	block: &mut [u8],
 	name: &OsStr,
 	config: Config,
-) -> IoResult<Option<(InodeNum, bool)>> {
+) -> IoResult<Option<(InodeNum, bool, u64)>> {
 	let mut file = Decoder::new(Cursor::new(block), config);
 	let mut prevpos = 0;
 
@@ -240,7 +247,7 @@ fn unlink_block(
 				}
 			}
 		}
-		return Ok(Some((hdr.inr, has)));
+		return Ok(Some((hdr.inr, has, pos)));
 	}
 
 	Ok(None)
@@ -310,9 +317,14 @@ impl<R: Backend> Ufs<R> {
 			let n = self.inode_read(dinr, pos, &mut block)?;
 			assert_eq!(n, DIRBLKSIZE);
 
-			if let Some((inr, has)) = unlink_block(dinr, &mut block, name, self.file.config())? {
+			if let Some((inr, has, at)) = unlink_block(dinr, &mut block, name, self.file.config())?
+			{
 				if has {
+					// The entry's inode number is already zero in `block`.  Record
+					// where it was, so the inode's reclamation can wait for the
+					// disk to agree the entry is gone.
 					self.inode_write(dinr, pos, &block)?;
+					self.note_dirent_removed(dinr, pos, at, inr)?;
 				} else {
 					let n =
 						self.inode_copy_range(dinr, &dino, (pos + DIRBLKSIZE as u64).., pos..)?;
@@ -431,7 +443,7 @@ impl<R: Backend> Ufs<R> {
 
 	/// The cache block holding the directory block at file offset `pos` of
 	/// `dinr`.
-	fn dirent_block(&mut self, dinr: InodeNum, pos: u64) -> IoResult<Option<u64>> {
+	pub(super) fn dirent_block(&mut self, dinr: InodeNum, pos: u64) -> IoResult<Option<u64>> {
 		let ino = self.read_inode(dinr)?;
 		let Some(info) = self.inode_locate(dinr, &ino, pos) else {
 			return Ok(None);
