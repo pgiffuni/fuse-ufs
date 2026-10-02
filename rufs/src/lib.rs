@@ -22,6 +22,6 @@ pub use crate::{
 	buf::{BlockDevice, Buffer, BufferCache},
 	data::{InodeAttr, InodeNum, InodeType},
 	geom::{AllocationSummary, CgNum},
-	softdep::{DepId, DepKind, DependencyEngine, Gate},
+	softdep::{DeferredOp, DeferredQueue, DepId, DepKind, DependencyEngine, Gate, OpKey},
 	ufs::{fsck::Report, mapping::BlockMapping, runs::BlockRun, Info, Ufs},
 };

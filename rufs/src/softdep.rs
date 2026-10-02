@@ -149,6 +149,11 @@ pub enum Gate {
 	/// The named inode has reached the device with its link count decremented.
 	InodeLinkCounted(InodeNum),
 	/// A directory block in the named parent has reached the device.
+	///
+	/// This one resolves on its own, unlike its neighbours: the block is named
+	/// explicitly, so a write of *that* block is the event, with no dependency to
+	/// look up.  It is what `MkdirParentDep` waits on -- a parent's link count
+	/// must not be published before the entry that justifies it.
 	DirectoryPersisted { parent: InodeNum, blk: u64 },
 
 	/// The directory entry at that byte offset has been removed *persistently*.
@@ -659,6 +664,237 @@ impl DependencyEngine {
 	}
 }
 
+/// Identity of a deferred operation.
+///
+/// Every deferred operation is keyed by *what it frees*, never by when it was
+/// queued or by anything about the Rust objects involved.  That is what makes
+/// duplicate detection work: a queue, a drain and a retry all have to agree
+/// that they are talking about the same filesystem effect.
+///
+/// The inode number alone is not enough, and the difference matters.  Inode
+/// numbers are reused, so a reclaim queued for inode 14 and a reclaim queued
+/// later for a *different* inode that also happens to be 14 are not the same
+/// operation.  The generation number disambiguates them: only a reclaim
+/// carrying the generation that was current when it was queued may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OpKey {
+	/// Release a block's allocation bit.
+	FreeBlock(u64),
+
+	/// Release an inode's allocation bit, at this generation.
+	FreeInode(InodeNum, u32),
+}
+
+impl OpKey {}
+
+/// A filesystem operation that cannot be performed yet.
+///
+/// # Why some operations cannot be gates
+///
+/// A byte-range gate holds a range back by *zeroing* it, which is right for a
+/// pointer -- zero means "no pointer here" -- and wrong for a counter, where
+/// zero is a different and wrong number rather than a stale one.  Blocking the
+/// whole buffer is sound for any content, but not for a cylinder group: it
+/// holds shared allocation state, so freezing it would freeze every unrelated
+/// allocation in the same group.
+///
+/// These operations therefore have to *wait to happen at all*, rather than merely
+/// wait to be written.  That is what this type is.
+///
+/// # State machine
+///
+/// ```text
+///                     queued
+///                       |
+///                       v
+///                   Pending  <--------------------- container already on disk:
+///                       |                              run immediately, never
+///                  container written                 enqueued at all
+///                       |
+///                       v
+///                   (removed from the queue, operation performed)
+/// ```
+///
+/// Only `Pending` is a stored state.  Readiness is *derived* from the container's
+/// persisted state rather than stored as a flag, so it cannot go stale between a
+/// dependency resolving and the next drain.  "Applied" is represented by absence
+/// from the queue: an operation is performed exactly once because performing it
+/// removes it, and a second drain has nothing to find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredOp {
+	/// Release a block's allocation bit.
+	///
+	/// Until this runs, the block still reads as *allocated* -- on the disk and
+	/// in the bitmap -- which is the point.  It must, because a crash in the
+	/// window has an on-disk pointer still reaching it, and a block that read as
+	/// free could be handed to the next allocation while that pointer survives.
+	FreeBlock {
+		/// The UFS block, a fragment address.
+		blk: u64,
+
+		/// How many bytes to release.  Always `fs_bsize` while allocation is
+		/// whole-block, and part of the identity: the same block freed twice with
+		/// different sizes is a double free either way.
+		size: u64,
+
+		/// The cache block that used to point at `blk`.
+		container: u64,
+	},
+
+	/// Release an inode's allocation bit.
+	///
+	/// The same reasoning: the inode still reads as allocated until this runs,
+	/// because the directory entry naming it may still be on the disk.
+	FreeInode {
+		/// The inode.
+		inr: InodeNum,
+
+		/// `di_gen` at the time the reclaim was queued.
+		gen: u32,
+
+		/// The cache block holding the inode's cleared image.
+		container: u64,
+	},
+}
+
+impl DeferredOp {
+	/// This operation's identity.
+	pub fn key(&self) -> OpKey {
+		match self {
+			Self::FreeBlock { blk, .. } => OpKey::FreeBlock(*blk),
+			Self::FreeInode { inr, gen, .. } => OpKey::FreeInode(*inr, *gen),
+		}
+	}
+
+	/// The cache block whose persistence makes this operation safe.
+	pub fn container(&self) -> u64 {
+		match self {
+			Self::FreeBlock { container, .. } | Self::FreeInode { container, .. } => *container,
+		}
+	}
+
+	/// Whether this operation may run now.
+	///
+	/// `persisted` says whether the container's current contents are on the
+	/// device.  It is passed in rather than looked up so that the queue does not
+	/// need the engine, and so that "runnable" is a question with one answer.
+	pub fn is_runnable(&self, persisted: bool) -> bool {
+		persisted
+	}
+
+	/// A short label, for logs and test failures.
+	pub fn label(&self) -> String {
+		match self {
+			Self::FreeBlock { blk, .. } => format!("free-block/{blk}"),
+			Self::FreeInode { inr, gen, .. } => format!("free-inode/{inr}@{gen}"),
+		}
+	}
+}
+
+/// The queue of operations waiting for a dependency.
+///
+/// Ordered by [`OpKey`], so a drain's behaviour does not depend on hash
+/// iteration order.  Correctness matters more than the order in which frees are
+/// applied -- a block free and an inode free touch different bitmaps -- but a
+/// deterministic order makes the tests reproducible and the drain explainable.
+///
+/// Indexed by container as well, so a dependency resolving does not scan every
+/// pending operation.
+#[derive(Debug, Default)]
+pub struct DeferredQueue {
+	pending:      BTreeMap<OpKey, DeferredOp>,
+	by_container: BTreeMap<u64, BTreeSet<OpKey>>,
+}
+
+impl DeferredQueue {
+	/// An empty queue.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// How many operations are waiting.
+	pub fn len(&self) -> usize {
+		self.pending.len()
+	}
+
+	/// Whether nothing is waiting.
+	pub fn is_empty(&self) -> bool {
+		self.pending.is_empty()
+	}
+
+	/// Every pending operation, in deterministic order.
+	pub fn iter(&self) -> impl Iterator<Item = &DeferredOp> {
+		self.pending.values()
+	}
+
+	/// Whether `op` is already queued.
+	pub fn contains(&self, key: &OpKey) -> bool {
+		self.pending.contains_key(key)
+	}
+
+	/// Queue `op`, refusing a duplicate.
+	///
+	/// Returns `false` if an operation with the same identity is already
+	/// waiting.  The caller decides what that means -- a second free of the same
+	/// block is a double free and should be rejected, whereas re-queueing after a
+	/// partial drain that never ran the operation is a no-op -- but the queue
+	/// itself only reports the fact.
+	///
+	/// Not relying on the allocation bitmap here is deliberate: a pending free
+	/// leaves the block reading as *allocated*, so the bitmap cannot distinguish
+	/// "free once" from "free twice".
+	pub fn push(&mut self, op: DeferredOp) -> bool {
+		let key = op.key();
+		if self.pending.contains_key(&key) {
+			return false;
+		}
+		self.by_container
+			.entry(op.container())
+			.or_default()
+			.insert(key);
+		self.pending.insert(key, op);
+		true
+	}
+
+	/// Take every operation whose container has been persisted.
+	///
+	/// `persisted` is asked per container, not per operation, so a container
+	/// holding several pending operations is looked up once.
+	///
+	/// The operations come out in [`OpKey`] order, so two drains over the same
+	/// queue perform them in the same sequence.
+	pub fn take_runnable(&mut self, mut persisted: impl FnMut(u64) -> bool) -> Vec<DeferredOp> {
+		let ready: Vec<OpKey> = self
+			.by_container
+			.iter()
+			.filter(|&(container, _)| persisted(*container))
+			.flat_map(|(_, keys)| keys.iter().copied())
+			.collect();
+		ready
+			.into_iter()
+			.filter_map(|key| {
+				let op = self.pending.remove(&key)?;
+				if let Some(keys) = self.by_container.get_mut(&op.container()) {
+					keys.remove(&key);
+					if keys.is_empty() {
+						self.by_container.remove(&op.container());
+					}
+				}
+				Some(op)
+			})
+			.collect()
+	}
+
+	/// Every operation waiting on `container`.
+	pub fn waiting_on(&self, container: u64) -> impl Iterator<Item = &DeferredOp> {
+		self.by_container
+			.get(&container)
+			.into_iter()
+			.flat_map(|keys| keys.iter())
+			.filter_map(|key| self.pending.get(key))
+	}
+}
+
 /// The write-ordering engine.
 #[derive(Debug, Default)]
 pub struct DependencyEngine {
@@ -1038,7 +1274,11 @@ impl DependencyEngine {
 	}
 
 	/// Re-evaluate a new-block allocation: has it become publishable?
-	fn gate_is_open(&self, gate: Gate) -> bool {
+	/// Whether `gate`'s precondition already holds.
+	///
+	/// A caller that wants to *set* a gate needs this: there is no point
+	/// recording a dependency on something that has already happened.
+	pub fn gate_is_open(&self, gate: Gate) -> bool {
 		match gate {
 			Gate::AllocationAllocated(id) => self.new_blocks.get(&id).is_some_and(|n| n.bitmap),
 			Gate::AllocationInitialised(id) => self.new_blocks.get(&id).is_some_and(|n| n.content),
@@ -1069,7 +1309,8 @@ impl DependencyEngine {
 					self.gate_is_open(*removal) && self.written.contains(blk)
 				})
 			}
-			Gate::InodeLinkCounted(_) | Gate::DirectoryPersisted { .. } => false,
+			Gate::DirectoryPersisted { blk, .. } => self.written.contains(&blk),
+			Gate::InodeLinkCounted(_) => false,
 		}
 	}
 }
@@ -1492,5 +1733,177 @@ mod t {
 				assert!(!s.is_empty());
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod deferred {
+	use super::*;
+
+	fn free_block(blk: u64, container: u64) -> DeferredOp {
+		DeferredOp::FreeBlock {
+			blk,
+			size: 32768,
+			container,
+		}
+	}
+
+	fn free_inode(inr: u32, gen: u32, container: u64) -> DeferredOp {
+		DeferredOp::FreeInode {
+			inr: unsafe { InodeNum::new(inr) },
+			gen,
+			container,
+		}
+	}
+
+	/// Nothing is runnable until its container is on the disk.
+	#[test]
+	fn an_operation_is_not_runnable_before_its_container_is_persisted() {
+		let op = free_block(100, 7);
+		assert!(!op.is_runnable(false));
+		assert!(op.is_runnable(true));
+
+		let mut q = DeferredQueue::new();
+		assert!(q.push(op));
+		assert_eq!(q.len(), 1);
+		// The container is not persisted, so nothing comes out -- twice, to show
+		// that a retry changes nothing.
+		assert!(q.take_runnable(|_| false).is_empty());
+		assert!(q.take_runnable(|_| false).is_empty());
+		assert_eq!(q.len(), 1, "a failed drain must not lose the work");
+	}
+
+	/// A runnable operation comes out exactly once.
+	#[test]
+	fn a_runnable_operation_is_taken_exactly_once() {
+		let mut q = DeferredQueue::new();
+		assert!(q.push(free_block(100, 7)));
+		let out = q.take_runnable(|c| c == 7);
+		assert_eq!(out.len(), 1);
+		assert_eq!(out[0].label(), "free-block/100");
+		assert!(q.is_empty());
+		// A second drain has nothing to do.
+		assert!(q.take_runnable(|_| true).is_empty());
+		assert_eq!(q.len(), 0);
+	}
+
+	/// Duplicate detection is by identity, not by timing.
+	#[test]
+	fn a_duplicate_is_refused() {
+		let mut q = DeferredQueue::new();
+		assert!(q.push(free_block(100, 7)), "first");
+		assert!(!q.push(free_block(100, 7)), "the same block twice");
+		assert_eq!(q.len(), 1, "the duplicate was not queued again");
+
+		// A *different* block, even on the same container, is not a duplicate.
+		assert!(q.push(free_block(101, 7)));
+		assert_eq!(q.len(), 2);
+
+		// The same inode at a different generation is a different operation:
+		// inode numbers are reused, and the old reclaim must not be satisfied by
+		// the new inode's.
+		assert!(q.push(free_inode(14, 7, 9)));
+		assert!(q.push(free_inode(14, 8, 9)));
+		assert!(q.push(free_inode(15, 7, 9)));
+		assert_eq!(q.len(), 5);
+	}
+
+	/// The order does not depend on insertion order.
+	#[test]
+	fn the_drain_order_is_deterministic() {
+		let mut a = DeferredQueue::new();
+		let mut b = DeferredQueue::new();
+		for blk in [300u64, 100, 200] {
+			a.push(free_block(blk, 1));
+		}
+		for blk in [200u64, 300, 100] {
+			b.push(free_block(blk, 1));
+		}
+		let order = |q: &mut DeferredQueue| {
+			q.take_runnable(|_| true)
+				.into_iter()
+				.map(|o| o.label())
+				.collect::<Vec<_>>()
+		};
+		let first = order(&mut a);
+		assert_eq!(
+			first,
+			order(&mut b),
+			"insertion order changed the drain order"
+		);
+		assert_eq!(
+			first,
+			["free-block/100", "free-block/200", "free-block/300"]
+		);
+	}
+
+	/// Several operations can share a container; resolving it releases them all,
+	/// and resolving a *different* container releases none of them.
+	#[test]
+	fn a_container_releases_only_its_own() {
+		let mut q = DeferredQueue::new();
+		for blk in [100u64, 101, 102] {
+			assert!(q.push(free_block(blk, 7)));
+		}
+		assert!(q.push(free_block(200, 8)));
+		assert_eq!(q.waiting_on(7).count(), 3);
+
+		let out = q.take_runnable(|c| c == 7);
+		assert_eq!(out.len(), 3);
+		assert_eq!(q.len(), 1, "the other container's work is untouched");
+		assert_eq!(q.waiting_on(7).count(), 0);
+
+		let out = q.take_runnable(|_| true);
+		assert_eq!(out.len(), 1);
+		assert!(q.is_empty());
+	}
+
+	/// Repeatedly draining reaches zero, which is the liveness property: an
+	/// operation whose container is eventually written must not be stranded.
+	#[test]
+	fn repeated_drains_make_progress() {
+		let mut q = DeferredQueue::new();
+		for blk in 0..16u64 {
+			assert!(q.push(free_block(blk, blk % 4)));
+		}
+		let mut persisted: std::collections::BTreeSet<u64> = Default::default();
+		let mut rounds = 0u64;
+		while !q.is_empty() {
+			// One more container is persisted per round: this is the
+			// "prerequisite eventually happens" the liveness claim rests on.
+			persisted.insert(rounds % 4);
+			let before = q.len();
+			q.take_runnable(|c| persisted.contains(&c));
+			assert!(
+				q.len() < before,
+				"a drain made no progress at round {rounds}"
+			);
+			rounds += 1;
+			assert!(rounds < 16, "the queue did not drain");
+		}
+		assert!(q.is_empty());
+	}
+
+	/// An operation enqueued when its container is *already* on the disk is
+	/// runnable immediately, so a caller may enqueue unconditionally.
+	#[test]
+	fn an_operation_whose_container_is_already_persisted_runs_at_once() {
+		let op = free_block(100, 7);
+		assert!(op.is_runnable(true));
+		let mut q = DeferredQueue::new();
+		assert!(q.push(op));
+		assert_eq!(q.take_runnable(|_| true).len(), 1);
+		assert!(q.is_empty());
+	}
+
+	/// The inode operation carries the generation, so a reused inode number is
+	/// distinguishable in the queue and in its label.
+	#[test]
+	fn an_inode_operation_is_keyed_by_generation() {
+		let old = free_inode(14, 7, 9);
+		let new = free_inode(14, 8, 9);
+		assert_ne!(old.key(), new.key());
+		assert_eq!(old.key(), OpKey::FreeInode(unsafe { InodeNum::new(14) }, 7));
+		assert_eq!(old.label(), "free-inode/14@7");
 	}
 }

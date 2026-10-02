@@ -458,6 +458,10 @@ impl<R: Backend> Ufs<R> {
 			self.softdep.note_inode_written(id)?;
 		}
 
+		// A directory entry that is now on the disk may be what a parent's link
+		// count was waiting for.
+		self.release_inode_blocks();
+
 		// A directory removal is persistent once its block has been written *in
 		// full*.  A safe write-back leaves the block's other gated ranges behind,
 		// so it cannot be said to have removed this entry -- and saying so would
@@ -484,6 +488,46 @@ impl<R: Backend> Ufs<R> {
 	/// image may go out as ordinary dirty metadata.
 	pub(super) fn removal_gate(&mut self, inr: InodeNum) -> Option<crate::softdep::Gate> {
 		self.softdep.removal_gate(inr)
+	}
+
+	/// Hold `parent`'s inode buffer back until the directory entry that
+	/// justifies a link count is on the disk.
+	///
+	/// This is `MkdirParentDep`.  The *whole buffer* is held back rather than
+	/// the eight bytes of `i_nlink`, because `Buffer::safe_image()` holds a
+	/// range back by zeroing it, and a zeroed `nlink` is a different and wrong
+	/// number rather than a stale one.  Not writing the buffer at all is sound
+	/// for any content: the device keeps what was already there, which was
+	/// consistent.
+	pub(super) fn block_inode_on_dir(&mut self, parent: InodeNum, inode_blk: u64, dir_blk: u64) {
+		if self
+			.softdep
+			.gate_is_open(crate::softdep::Gate::DirectoryPersisted {
+				parent,
+				blk: dir_blk,
+			}) {
+			return;
+		}
+		self.buf.block(inode_blk, dir_blk);
+		self.blocked_inodes.push((inode_blk, dir_blk, parent));
+	}
+
+	/// Release every held-back inode buffer whose directory entry is now on the
+	/// disk.
+	fn release_inode_blocks(&mut self) {
+		self.blocked_inodes.retain(|&(inode_blk, dir_blk, parent)| {
+			if self
+				.softdep
+				.gate_is_open(crate::softdep::Gate::DirectoryPersisted {
+					parent,
+					blk: dir_blk,
+				}) {
+				self.buf.release(inode_blk, dir_blk);
+				false
+			} else {
+				true
+			}
+		});
 	}
 
 	/// Record that the directory entry at `block_off` in `dinr` has been

@@ -564,9 +564,19 @@ impl<R: Backend> Ufs<R> {
 			.mknod(dinr, name, InodeType::Directory, perm, uid, gid)?
 			.inr;
 
+		// The entry `mknod()` just staged is in the last directory block, so
+		// that block is the one the parent's link count has to wait for.
+		let dsize = self.read_inode(dinr)?.size;
+		let dir_blk = match self.dirent_block(dinr, dsize.saturating_sub(1))? {
+			Some(b) => b,
+			None => self.dirent_block(dinr, 0)?.ok_or_else(|| err!(EIO))?,
+		};
+		let parent_blk = self.metadata_blk(self.superblock.ino_to_fsba(dinr));
+
 		let mut dino = self.read_inode(dinr)?;
 		dino.nlink += 1;
 		self.write_inode(dinr, &dino)?;
+		self.block_inode_on_dir(dinr, parent_blk, dir_blk);
 
 		// update nlink
 		let mut ino = self.read_inode(inr)?;

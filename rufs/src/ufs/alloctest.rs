@@ -2606,3 +2606,105 @@ mod crash {
 		}
 	}
 }
+
+/// `MkdirParentDep`: a parent's link count must not reach the disk before the
+/// entry that justifies it.
+#[cfg(test)]
+mod mkdirdep {
+	use super::*;
+	use crate::{InodeNum, InodeType};
+
+	/// The parent inode's cache block.
+	fn parent_blk(ug: &mut Ufs<std::fs::File>, dinr: InodeNum) -> u64 {
+		ug.metadata_blk(ug.superblock.ino_to_fsba(dinr))
+	}
+
+	#[test]
+	fn the_parents_inode_is_held_back_until_the_entry_is_on_disk() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		// Settle the parent first, so its buffer is clean and any hold-back is
+		// this operation's doing rather than a leftover.
+		ug.sync_metadata().unwrap();
+
+		let before = ug.read_inode(InodeNum::ROOT).unwrap().nlink;
+		ug.mkdir(InodeNum::ROOT, OsStr::new("zzz-md"), 0o755, 0, 0)
+			.unwrap();
+
+		// Live: the running filesystem counts the new directory.
+		assert_eq!(ug.read_inode(InodeNum::ROOT).unwrap().nlink, before + 1);
+		// And the parent's inode buffer is not writable.
+		let pblk = parent_blk(&mut ug, InodeNum::ROOT);
+		assert!(
+			ug.metadata_cache().is_blocked(pblk),
+			"the parent's link count could reach the disk before the entry"
+		);
+		assert!(
+			!ug.dependencies().is_quiescent(),
+			"nothing may be waiting, yet a link count is"
+		);
+
+		// A drain lets the entry out, and releases the parent.
+		ug.sync_metadata().unwrap();
+		assert!(
+			!ug.metadata_cache().is_blocked(pblk),
+			"the parent was never released"
+		);
+		assert!(ug.dependencies().is_quiescent());
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		let on_disk = ug.read_inode(InodeNum::ROOT).unwrap().nlink;
+		assert_eq!(on_disk, before + 1, "the new directory was not persisted");
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// A crash between the parent's count and the entry is what the hold-back
+	/// exists to prevent, so the suite has to see the *contradiction* gone even
+	/// though the state is still classified as an incompleteness: the entry is
+	/// simply not there yet to be inconsistent about.
+	#[test]
+	fn a_crash_before_the_entry_leaves_a_repairable_state_only() {
+		for n in 0..6 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			ug.sync_metadata().unwrap();
+			ug.mkdir(InodeNum::ROOT, OsStr::new("zzz-mdc"), 0o755, 0, 0)
+				.unwrap();
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let report = ug.check_consistency().unwrap();
+			assert!(report.is_coherent(), "crash after {n} passes: {report:?}");
+			// Whether the directory exists is not the point; whether the image
+			// is self-consistent is.
+			let _ = ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-mdc"));
+		}
+	}
+
+	/// A file created in a directory does not touch the parent's `nlink`, so no
+	/// hold-back should appear for one.
+	#[test]
+	fn a_plain_create_does_not_block_the_parent() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		ug.sync_metadata().unwrap();
+		let pblk = parent_blk(&mut ug, InodeNum::ROOT);
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new("zzz-noblock"),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap();
+		assert!(
+			!ug.metadata_cache().is_blocked(pblk),
+			"creating a file must not hold the parent back"
+		);
+		ug.sync_metadata().unwrap();
+	}
+}

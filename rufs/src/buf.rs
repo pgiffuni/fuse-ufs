@@ -311,6 +311,15 @@ pub struct BufferCache {
 	buffers: BTreeMap<u64, Buffer>,
 	/// Dirty buffers, oldest first.
 	order:   VecDeque<u64>,
+
+	/// Gates holding buffers from being written, keyed by the block and the
+	/// opaque token the caller recognises.
+	///
+	/// The tokens are opaque here on purpose: this layer knows about bytes and
+	/// blocks, and [`crate::softdep`] knows about dependencies.  The owner
+	/// keeps the token-to-gate mapping and calls [`Self::release`] when one
+	/// opens, so the dependency types never reach down here.
+	blocked: BTreeMap<u64, BTreeSet<u64>>,
 	stats:   Stats,
 }
 
@@ -323,8 +332,48 @@ impl BufferCache {
 			fsize,
 			buffers: BTreeMap::new(),
 			order: VecDeque::new(),
+			blocked: BTreeMap::new(),
 			stats: Stats::default(),
 		}
+	}
+
+	/// Whether a buffer is held back by a gate, and therefore not written.
+	///
+	/// Unlike an unsafe *range*, this writes nothing wrong: the buffer simply
+	/// stays dirty until the gate opens and the device keeps whatever was there
+	/// before, which was -- by induction -- consistent.
+	///
+	/// That is the difference that matters, and it is why a whole buffer can be
+	/// held back when a byte range inside one cannot.  `Buffer::safe_image()`
+	/// holds a range back by *zeroing* it, which is right for a pointer and
+	/// wrong for a count; not writing the buffer at all is right for both.
+	///
+	/// Hold buffer `blk` from being written until the gate named by `token`
+	/// opens.
+	///
+	/// Returns `false` if the gate has already opened, in which case there is
+	/// nothing to hold back.
+	pub fn block(&mut self, blk: u64, token: u64) -> bool {
+		self.blocked.entry(blk).or_default().insert(token)
+	}
+
+	/// Release one gate, and forget the buffer if nothing is holding it.
+	///
+	/// Returns whether anything was released.
+	pub fn release(&mut self, blk: u64, token: u64) -> bool {
+		let Some(tokens) = self.blocked.get_mut(&blk) else {
+			return false;
+		};
+		let had = tokens.remove(&token);
+		if tokens.is_empty() {
+			self.blocked.remove(&blk);
+		}
+		had
+	}
+
+	/// Whether `blk` is held back by any gate.
+	pub fn is_blocked(&self, blk: u64) -> bool {
+		self.blocked.get(&blk).is_some_and(|t| !t.is_empty())
 	}
 
 	/// Block size.
@@ -407,6 +456,12 @@ impl BufferCache {
 		let Some(b) = self.buffers.get(&blk) else {
 			return Ok(Written::Clean);
 		};
+		// A blocked buffer stays dirty *and* stays in the dirty order, so this
+		// is a skip rather than a removal: a later pass picks it up once the
+		// gate has opened.
+		if self.is_blocked(blk) {
+			return Ok(Written::Clean);
+		}
 		if !b.needs_write() {
 			return Ok(Written::Clean);
 		}

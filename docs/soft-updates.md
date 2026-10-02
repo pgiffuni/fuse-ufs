@@ -232,8 +232,78 @@ two entries naming an inode whose `nlink` admits one is a reference that will
 dangle when either is removed.  `fsck` cannot tell which entry is the stale
 one, so it must not be handed a state where the answer is a guess.
 
-Closing the window needs the deferral again: hold the counter update until the
-entry is persistent.
+`MkdirParentDep` closes it, and *not* by gating the count.  A gate holds a
+range back by zeroing it, so `i_nlink` cannot be gated; the whole inode buffer
+is held back instead, which is sound for any content because the device then
+keeps what was already there.  `BufferCache::block()` does that, and
+`Gate::DirectoryPersisted { parent, blk }` opens on a write of the named
+directory block.
+
+`FreeBlocksDep` and `InodeReclaim` cannot use the same trick: their *own* buffer
+is the cylinder group, and holding that back would freeze every other
+allocation in the group.  They need the deferral proper -- perform the free in a
+later pass once the container is persistent -- which is still to do.
+
+### The deferred work queue exists; nothing is wired to it yet
+
+`DeferredOp` and `DeferredQueue` (in `rufs/src/softdep.rs`) are the mechanism
+`FreeBlocksDep` and `InodeReclaim` need, with tests and no callers.  The state
+machine stores one state (`Pending`); readiness is derived from the container's
+persisted state rather than stored, so it cannot go stale between a dependency
+resolving and the next drain; and `Applied` is represented by absence from the
+queue, so a second drain has nothing to find.
+
+Two things the design settled that are worth keeping:
+
+* Identity is what the operation *frees*, never when it was queued.  A block free
+  is keyed by the block; an inode free by `(inode, generation)`, because inode
+  numbers are reused and an old reclaim must not be satisfied by a later inode
+  that happens to have the same number.
+* Duplicate detection cannot use the allocation bitmap, and that is the whole
+  reason it is needed: a *pending* free leaves the block reading as allocated --
+  deliberately, because a crash in the window has a pointer still reaching it --
+  so "freed once" and "freed twice" are indistinguishable to the bitmap.
+
+**The wiring is not done**, after two attempts.  The useful thing both attempts
+established is *where* it goes wrong.
+
+`blk_free` decides between freeing now and queueing by asking
+`DependencyEngine::container_is_persisted(container)`, and that flag is not a
+first-class part of the cache's contract -- it is a side channel maintained by
+two call sites in `rufs/src/ufs/meta.rs`:
+
+  * `metadata_block()` sets it to `!buffer.is_dirty()`, on the theory that a
+    clean buffer was fully written and so matches the disk;
+  * `metadata_block_mut()` clears it, on the theory that a mutable borrow is the
+    start of a change.
+
+Tracing `inode_truncate` shows neither assumption holds in the case that
+matters.  `inode_shrink` frees twenty data blocks and one indirect block; the
+containers are the inode block and the first-level indirect block.  Both
+`blk_free` calls took the **immediate** path -- `container_is_persisted` returned
+true -- so nothing was queued, the drain had nothing to do, and the blocks were
+released while the inode still pointed at them.  That is precisely the failure
+the deferral exists to prevent, and it happened because the flag said so.
+
+So the flag, not the queue, is what needs fixing.  Two things are wrong with it:
+
+* "clean implies persisted" is only true if a buffer is never written *safely*.
+  It is -- a safe write leaves the buffer dirty -- but the converse is not
+  tracked: a buffer can be dirty, fully written, and still have gated ranges
+  outstanding, and that is a state the flag cannot currently express.
+* It is derived from `is_dirty()` at *access* time, which means the answer
+  depends on whether something happened to touch the buffer since the last
+  write.  A deferred free needs a statement about the filesystem, not about the
+  last access.
+
+The right shape is for `BufferCache` to say whether a block's *live image* is on
+the device -- a property of the cache, not a side effect of who last asked --
+and for `note_block_written` to keep it.  That is close to the existing
+`Written::{Safe,Full}` report, but it has to survive the difference between "written
+safely and still gated" and "written in full", which `needs_write()` collapses.
+
+Do not build the deferral on the current flag.  Fix the flag first, with a test
+that a buffer written safely and then gated is *not* reported as persisted.
 
 ### Two asymmetries worth remembering
 

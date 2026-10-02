@@ -124,6 +124,12 @@ pub struct Ufs<R: Backend> {
 	/// `Ufs::metadata_read` and friends, in [`mod@meta`].
 	buf: BufferCache,
 
+	/// Inode buffers held back until a directory entry is on the disk.
+	///
+	/// `(inode buffer block, the directory block holding the entry, the parent)`.
+	/// See [`Self::block_inode_on_dir`].
+	blocked_inodes: Vec<(u64, u64, InodeNum)>,
+
 	/// Soft Updates dependency graph.
 	///
 	/// Owns the gates: byte ranges of cached buffers that may not be persisted
@@ -179,6 +185,7 @@ impl<R: Backend> Ufs<R> {
 			alloc: AllocationSummary::new(0),
 			cg_sums: CgSums::default(),
 			buf,
+			blocked_inodes: Vec::new(),
 			softdep: DependencyEngine::new(),
 		};
 		s.check()?;
