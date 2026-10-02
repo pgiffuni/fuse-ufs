@@ -63,7 +63,7 @@ fn metadata_cache(sb: &Superblock) -> IoResult<BufferCache> {
 pub mod mapping;
 pub mod runs;
 
-mod meta;
+pub mod meta;
 
 /// Summary of filesystem statistics.
 #[derive(Debug, Clone)]

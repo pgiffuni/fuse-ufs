@@ -1024,6 +1024,26 @@ impl<R: Backend> Ufs<R> {
 		was_dir: bool,
 	) -> IoResult<()> {
 		let (cg, off) = self.superblock.ino_in_cg(inr);
+
+		// The inode is zero by now, so `di_gen` cannot be read back.  If it is
+		// readable *and* carries a different generation, the number has been
+		// reallocated since the release was queued, and releasing the bit now
+		// would free somebody else's inode.
+		//
+		// A zero generation means the inode was cleared, which is the ordinary
+		// case and says nothing.
+		if let Ok(ino) = self.read_inode(inr) {
+			if ino.gen != 0 && ino.gen != gen {
+				log::error!(
+					"free_cg_inode_now({inr}): generation is {} but the queued \
+					 release was for generation {gen}; the inode number has been \
+					 reallocated and must not be freed",
+					ino.gen
+				);
+				return Err(err!(EINVAL));
+			}
+		}
+
 		let mut cgd = self.read_cg(cg)?;
 		let mut map = self.read_inomap(cg, &cgd)?;
 
@@ -1048,7 +1068,6 @@ impl<R: Backend> Ufs<R> {
 				sb.cstotal.ndir -= 1;
 			}
 		})?;
-		let _ = gen;
 		log::trace!("free_cg_inode_now({inr}): applied");
 		Ok(())
 	}

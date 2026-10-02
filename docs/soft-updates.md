@@ -504,6 +504,38 @@ checker.
   write that bypasses the cache has no ordering (see the audit above; there
   are none today).
 
+## 3.6 Sync and shutdown
+
+`sync_metadata()` drains everything it **can**.  That is not the same as being
+finished, and the two are easy to confuse because both end in "I wrote what I
+wrote".
+
+`Ufs::metadata_status()` reports the difference, and a caller that needs the
+stronger claim asks:
+
+| field | non-zero means |
+|---|---|
+| `dirty` | buffers with unsaved changes |
+| `blocked` | inode buffers held back by a whole-buffer dependency |
+| `unresolved` | dependencies created and not yet resolved |
+| `pending` | deferred frees and inode releases waiting for a container |
+| `in_flight` | allocations short of publishable |
+
+`is_drained()` is all five zero.  After a full drain, a filesystem with nothing
+depending on a later operation reports true; mid-operation it does not, which is
+how a caller tells "finished" from "not started yet".
+
+`Ufs::shutdown()` drains and *returns the status* rather than discarding it.  The
+one failure Soft Updates must not have is work quietly vanishing: a deferred free
+that disappears at unmount takes with it the only record that the block was
+being held back.  So shutdown reports, and lets whoever can act on it decide.
+
+What a sync does **not** do is resolve a dependency that no event can resolve.
+`Gate::InodeLinkCounted` is the example of a gate with no producer -- it protects
+a counter, and a counter cannot be byte-range gated -- so a range gated on it
+would be held back for the life of the mount.  Nothing raises it today, and
+`validate()` says so if one ever does.
+
 ## 4. What is not implemented
 
 These are the remaining phases.  For each: what has to be created, the ordering

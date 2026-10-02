@@ -1168,6 +1168,37 @@ impl DependencyEngine {
 		len: u64,
 		gate: Gate,
 	) -> IoResult<DepId> {
+		// A gate on something that cannot change is a programming error, and the
+		// cost of accepting one is unbounded: the range is held back and nothing
+		// will ever release it, so a caller who asked for an ordering guarantee
+		// silently gets a filesystem that stops changing instead.
+		//
+		// The case that matters is a *retired* allocation.  `note_pointer_published`
+		// removes a completed `NewBlockDep`, after which `Gate::AllocationSafe(id)`
+		// and "an allocation that never started" are indistinguishable -- both are
+		// simply absent.  `Ufs` does not hit this, because it creates a pointer
+		// dependency before its allocation can complete, but nothing in the
+		// engine enforced that and a future change to the ordering would hit it as
+		// a hang rather than as an error.
+		match gate {
+			Gate::AllocationAllocated(id) |
+			Gate::AllocationInitialised(id) |
+			Gate::AllocationSafe(id)
+				if !self.new_blocks.contains_key(&id) =>
+			{
+				return Err(std::io::Error::other(format!(
+					"cannot gate on allocation {id:?}: it is not an outstanding \
+					 allocation (it may have been retired)"
+				)));
+			}
+			Gate::InodeWritten(inr) if !self.by_inode.contains_key(&inr) => {
+				return Err(std::io::Error::other(format!(
+					"cannot gate on inode {inr:?}: it was never registered"
+				)));
+			}
+			_ => {}
+		}
+
 		let id = self.alloc_id();
 		// The buffer must be resident: a caller that has just written a pointer
 		// into it necessarily has, and a gate on a block that is not in the
@@ -1351,7 +1382,7 @@ mod t {
 	const BSIZE: u64 = 4096;
 
 	#[derive(Default)]
-	struct MemDev {
+	pub(super) struct MemDev {
 		data:   Vec<u8>,
 		writes: Vec<(u64, Vec<u8>)>,
 	}
@@ -1375,7 +1406,7 @@ mod t {
 		}
 	}
 
-	fn setup() -> (DependencyEngine, BufferCache, MemDev) {
+	pub(super) fn setup() -> (DependencyEngine, BufferCache, MemDev) {
 		let dev = MemDev {
 			data:   vec![0u8; (BSIZE * 8) as usize],
 			writes: Vec::new(),
@@ -1647,6 +1678,9 @@ mod t {
 	fn directory_add_gates_on_the_inode() {
 		let (mut e, mut cache, mut dev) = setup();
 		let ino = unsafe { InodeNum::new(700) };
+		// `gate()` refuses an inode that was never registered: nothing would ever
+		// open that gate, so the range would be held back forever.
+		e.new_inode(ino, CgNum::new(0));
 		cache.get_mut(&mut dev, 4).unwrap().data_mut()[0..8].copy_from_slice(&700u64.to_le_bytes());
 		let p = e
 			.gate(
@@ -1679,14 +1713,19 @@ mod t {
 		let (mut e, mut cache, mut dev) = setup();
 		cache.get(&mut dev, 4).unwrap();
 		let ino = unsafe { InodeNum::new(700) };
+		// `InodeWritten` needs the inode registered; `gate()` refuses one that
+		// was never allocated, because nothing would ever open it.
+		e.new_inode(ino, CgNum::new(0));
+		// `InodeLinkCounted` and `InodeReclaimed` are left out: they protect
+		// counters, nothing opens them, and `a_dependency_that_can_never_resolve_
+		// is_reported` covers that they are still visible when something does
+		// raise one.
 		for gate in [
 			Gate::InodeWritten(ino),
-			Gate::InodeLinkCounted(ino),
 			Gate::DirectoryPersisted {
 				parent: ino,
 				blk:    4,
 			},
-			Gate::InodeReclaimed(ino),
 		] {
 			let p = e
 				.gate(&mut cache, DepKind::DirectoryAdd, 4, 0, 8, gate)
@@ -1756,9 +1795,188 @@ mod t {
 	}
 }
 
+impl DependencyEngine {
+	/// How many dependencies are created and *not yet resolved*.
+	///
+	/// Counting `deps.len()` instead would include resolved ones, which the
+	/// engine keeps for history and never removes.  That mistake made two
+	/// correctly-published dependencies look like two stuck ones, and sent the
+	/// investigation looking for a lifecycle bug that was not there.
+	pub fn unresolved(&self) -> usize {
+		self.deps.values().filter(|d| !d.resolved).count()
+	}
+
+	/// How many allocations are still short of publishable.
+	pub fn in_flight(&self) -> usize {
+		self.new_blocks
+			.values()
+			.filter(|n| !n.allows_publication())
+			.count()
+	}
+
+	/// The unresolved dependencies and where each says it is waiting.
+	///
+	/// `(id, kind, gate, resolved, listed)`.  A correct engine lists only
+	/// unresolved dependencies, each under its own gate; anything else is a
+	/// registration bug, and `validate()` says which.
+	pub fn unresolved_gates(&self) -> Vec<(DepId, DepKind, Gate, bool, bool)> {
+		self.deps
+			.values()
+			.map(|d| {
+				let listed = self
+					.waiting_on
+					.get(&d.gate)
+					.is_some_and(|ids| ids.contains(&d.id));
+				(d.id, d.kind, d.gate, d.resolved, listed)
+			})
+			.collect()
+	}
+
+	/// Report anything that cannot be right.
+	///
+	/// Small assertions, not a theorem prover.  The point is not to prove the
+	/// graph is sound -- it is to make a *future* mistake fail loudly here
+	/// rather than quietly leaving metadata unpublished or, worse, published
+	/// early.
+	///
+	/// Returns one string per problem; empty means nothing obviously wrong.
+	pub fn validate(&self) -> Vec<String> {
+		let mut out = Vec::new();
+
+		// A gate nothing ever opens.  `Gate::InodeLinkCounted` and
+		// `Gate::InodeReclaimed` have no producer, because both protect a
+		// counter and a counter cannot be gated; a range held back on one of
+		// them would stay held back for the life of the mount.
+		for (gate, ids) in &self.waiting_on {
+			if matches!(gate, Gate::InodeLinkCounted(_) | Gate::InodeReclaimed(_)) {
+				out.push(format!(
+					"{gate:?} is waiting on {ids:?} but nothing ever opens it; \
+					 the gated range would never be published"
+				));
+			}
+			// A gate that has opened while its dependency still waits means the
+			// two disagree about the world.
+			if self.gate_is_open(*gate) {
+				for id in ids {
+					out.push(format!("{gate:?} is already open but {id:?} still waits"));
+				}
+			}
+		}
+
+		// A completed allocation still in the map: it should have been pruned.
+		for (id, n) in &self.new_blocks {
+			if n.complete {
+				out.push(format!("{id:?} is complete but was never pruned"));
+			}
+		}
+
+		// An *unresolved* dependency naming an allocation or an inode that does
+		// not exist.  A resolved one may legitimately name a retired
+		// allocation: `note_pointer_published` removes the `NewBlockDep`, and the
+		// dependency it published stays in `deps` for history.
+		for (id, dep) in self.deps.iter().filter(|(_, d)| !d.resolved) {
+			match dep.gate {
+				Gate::AllocationAllocated(a) |
+				Gate::AllocationInitialised(a) |
+				Gate::AllocationSafe(a)
+					if !self.new_blocks.contains_key(&a) =>
+				{
+					out.push(format!("{id:?} gates on {a:?}, which is not an allocation"));
+				}
+				Gate::InodeWritten(inr) if !self.by_inode.contains_key(&inr) => {
+					out.push(format!(
+						"{id:?} gates on inode {inr:?}, which was never registered"
+					));
+				}
+				_ => {}
+			}
+		}
+
+		out.extend(self.validate_registration());
+		out
+	}
+
+	/// The registration invariant: an unresolved dependency occurs in exactly one
+	/// `waiting_on` entry -- the one keyed by its own gate -- and a resolved one
+	/// occurs in none.
+	///
+	/// `deps` and `waiting_on` are two representations of the same relationship,
+	/// and nothing keeps them in step except the places that touch `waiting_on`:
+	/// `gate`, `settle`, `settle_inode`, `settle_removal` and `signal`.  This is
+	/// where a mistake in one of them shows up, and naming the shape of the
+	/// corruption is worth more than guessing at a fix.
+	fn validate_registration(&self) -> Vec<String> {
+		let mut out = Vec::new();
+
+		// Where each dependency claims to be waiting.
+		let mut claims: BTreeMap<DepId, Vec<&Gate>> = BTreeMap::new();
+		for (gate, ids) in &self.waiting_on {
+			let mut seen = BTreeSet::new();
+			for id in ids {
+				if !seen.insert(*id) {
+					out.push(format!("case D: {id:?} is listed twice under {gate:?}"));
+				}
+				claims.entry(*id).or_default().push(gate);
+			}
+		}
+
+		for (id, dep) in &self.deps {
+			let empty: &[&Gate] = &[];
+			let sites = claims.get(id).map(Vec::as_slice).unwrap_or(empty);
+			match (dep.resolved, sites.len()) {
+				// Resolved and listed nowhere: correct.
+				(true, 0) => {}
+				// Case A: published, but the entry survived.
+				(true, _) => {
+					out.push(format!(
+						"case A: {id:?} is resolved but still listed under {sites:?}"
+					))
+				}
+				// Case B: honestly waiting, under its own gate, and the gate is
+				// open -- so whoever should have published it did not.
+				(false, 1) => {
+					if sites[0] != &dep.gate {
+						out.push(format!(
+							"case C: {id:?} gates on {:?} but is listed under {:?}",
+							dep.gate, sites[0]
+						));
+					} else if self.gate_is_open(dep.gate) {
+						out.push(format!(
+							"case B: {id:?} is unresolved under {:?}, which is open",
+							dep.gate
+						));
+					}
+				}
+				// Case E: unresolved and listed nowhere, so nothing will publish it.
+				(false, 0) => out.push(format!("case E: {id:?} is unresolved and listed nowhere")),
+				// Case C: listed under more than one gate, or the wrong one.
+				(false, _) => {
+					out.push(format!(
+						"case C: {id:?} gates on {:?} but is listed under {sites:?}",
+						dep.gate
+					))
+				}
+			}
+		}
+
+		// Case F: listed but no longer a dependency at all.
+		for (gate, ids) in &self.waiting_on {
+			for id in ids {
+				if !self.deps.contains_key(id) {
+					out.push(format!(
+						"case F: {id:?} is listed under {gate:?} but is not a dependency"
+					));
+				}
+			}
+		}
+
+		out
+	}
+}
+
 #[cfg(test)]
 mod deferred {
-	use super::*;
+	use super::{t::setup, *};
 
 	fn free_block(blk: u64, container: u64) -> DeferredOp {
 		DeferredOp::FreeBlock {
@@ -1903,6 +2121,516 @@ mod deferred {
 			assert!(rounds < 16, "the queue did not drain");
 		}
 		assert!(q.is_empty());
+	}
+
+	/// Validation catches a gate that nothing will ever open.
+	///
+	/// `Gate::InodeLinkCounted` and `Gate::InodeReclaimed` protect counters,
+	/// and a counter cannot be byte-range gated, so nothing raises them.  A
+	/// range held back on one would stay held back for the life of the mount,
+	/// which is the kind of failure that looks like "the filesystem got slow".
+	#[test]
+	fn validate_reports_a_gate_nothing_opens() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		assert!(
+			e.validate().is_empty(),
+			"a fresh engine is clean: {:?}",
+			e.validate()
+		);
+
+		let ino = unsafe { InodeNum::new(700) };
+		for gate in [Gate::InodeLinkCounted(ino), Gate::InodeReclaimed(ino)] {
+			e.gate(&mut cache, DepKind::DirectoryRemove, 4, 0, 8, gate)
+				.unwrap();
+		}
+		let problems = e.validate();
+		assert_eq!(problems.len(), 2, "{problems:?}");
+		assert!(
+			problems.iter().all(|p| p.contains("nothing ever opens")),
+			"{problems:?}"
+		);
+
+		// And the buffer is still there, still dirty, and would never be written.
+		assert!(cache.peek(4).unwrap().has_unsafe_ranges());
+	}
+
+	/// Validation catches a dependency on something that does not exist, which
+	/// is what a stale `DepId` looks like.
+	#[test]
+	fn validate_reports_an_unknown_allocation() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ghost = DepId(4242);
+		// `gate()` itself refuses an unknown allocation, so reach the state
+		// through a real allocation and then take it away.
+		let real = e.new_block(100, crate::geom::CgNum::new(0));
+		e.gate(
+			&mut cache,
+			DepKind::DirectPointer,
+			4,
+			0,
+			8,
+			Gate::AllocationSafe(real),
+		)
+		.unwrap();
+		assert!(e.validate().is_empty());
+		e.new_blocks.remove(&real);
+		let problems = e.validate();
+		assert!(
+			problems.iter().any(|p| p.contains("not an allocation")),
+			"{problems:?}"
+		);
+		let _ = ghost;
+	}
+
+	/// Validation catches a gate that has opened while its dependency waits.
+	#[test]
+	fn validate_reports_an_open_gate_with_a_waiting_dependency() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(700) };
+		// The inode has to be registered before anything may gate on it, or
+		// validate is right to complain about the dangling gate instead.
+		let id = e.new_inode(ino, crate::geom::CgNum::new(0));
+		let dep = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				0,
+				8,
+				Gate::InodeWritten(ino),
+			)
+			.unwrap();
+		assert!(e.validate().is_empty(), "{:?}", e.validate());
+
+		// Satisfying the gate settles the dependency, which is what normally
+		// happens and is why this state cannot be reached through the API.  It
+		// *can* be reached by a future change that opens a gate and forgets to
+		// settle, which is exactly what validate is here to catch.
+		e.note_inode_bitmap_written(id).unwrap();
+		e.note_inode_written(id).unwrap();
+		assert!(e.validate().is_empty());
+		e.deps.get_mut(&dep).expect("still there").resolved = false;
+		e.waiting_on.insert(Gate::InodeWritten(ino), vec![dep]);
+		let problems = e.validate();
+		assert!(
+			problems.iter().any(|p| p.contains("already open")),
+			"{problems:?}"
+		);
+	}
+
+	/// Validation catches an allocation that completed and was never pruned.
+	#[test]
+	fn validate_reports_an_unpruned_completed_allocation() {
+		let (mut e, _cache, _dev) = setup();
+		let id = e.new_block(100, crate::geom::CgNum::new(0));
+		e.note_bitmap_written(id).unwrap();
+		e.note_contents_written(id).unwrap();
+		e.note_pointer_published(id).unwrap();
+		assert!(e.new_blocks.is_empty(), "the engine pruned it");
+
+		// Put a completed one back, as a bug elsewhere would.
+		e.new_blocks.insert(
+			id,
+			NewBlockDep {
+				id,
+				blk: 100,
+				cg: crate::geom::CgNum::new(0),
+				bitmap: true,
+				content: true,
+				publish: true,
+				complete: true,
+			},
+		);
+		assert!(e.validate().iter().any(|p| p.contains("never pruned")));
+	}
+
+	/// The registration invariant, in both directions.
+	///
+	/// `deps` and `waiting_on` are two representations of the same fact, and an
+	/// unresolved dependency must appear in exactly one `waiting_on` entry -- the
+	/// one keyed by its own gate -- while a resolved one must appear in none.
+	/// These build each of the four shapes `validate()` distinguishes and check
+	/// that it is reported, so the diagnostic cannot rot.
+	fn dep(blk: u64, off: u64, len: u64) -> (u64, u64, u64) {
+		(blk, off, len)
+	}
+
+	#[test]
+	fn registration_invariant_is_reported_in_every_corrupt_shape() {
+		// Case A: published, but the entry survived.
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(700) };
+		let id = e.new_inode(ino, crate::geom::CgNum::new(0));
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				0,
+				8,
+				Gate::InodeWritten(ino),
+			)
+			.unwrap();
+		e.note_inode_bitmap_written(id).unwrap();
+		e.note_inode_written(id).unwrap();
+		assert!(
+			e.validate().is_empty(),
+			"the healthy shape is clean: {:?}",
+			e.validate()
+		);
+		// Put the entry back by hand.
+		e.waiting_on.insert(Gate::InodeWritten(ino), vec![d]);
+		assert!(
+			e.validate().iter().any(|p| p.contains("case A")),
+			"{:?}",
+			e.validate()
+		);
+
+		// Case E: unresolved and listed nowhere, so nothing will publish it.
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(701) };
+		e.new_inode(ino, crate::geom::CgNum::new(0));
+		e.gate(
+			&mut cache,
+			DepKind::DirectoryAdd,
+			4,
+			0,
+			8,
+			Gate::InodeWritten(ino),
+		)
+		.unwrap();
+		e.waiting_on.remove(&Gate::InodeWritten(ino));
+		assert!(
+			e.validate().iter().any(|p| p.contains("case E")),
+			"{:?}",
+			e.validate()
+		);
+		let _ = dep(4, 0, 8);
+
+		// Case C: listed under a gate that is not its own.
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(702) };
+		let other = unsafe { InodeNum::new(703) };
+		e.new_inode(ino, crate::geom::CgNum::new(0));
+		e.new_inode(other, crate::geom::CgNum::new(0));
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				0,
+				8,
+				Gate::InodeWritten(ino),
+			)
+			.unwrap();
+		e.waiting_on.remove(&Gate::InodeWritten(ino));
+		e.waiting_on.insert(Gate::InodeWritten(other), vec![d]);
+		assert!(
+			e.validate().iter().any(|p| p.contains("case C")),
+			"{:?}",
+			e.validate()
+		);
+
+		// Case D: the same dependency listed twice.
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(704) };
+		e.new_inode(ino, crate::geom::CgNum::new(0));
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				0,
+				8,
+				Gate::InodeWritten(ino),
+			)
+			.unwrap();
+		e.waiting_on.insert(Gate::InodeWritten(ino), vec![d, d]);
+		assert!(
+			e.validate().iter().any(|p| p.contains("case D")),
+			"{:?}",
+			e.validate()
+		);
+
+		// Case F: listed, but no longer a dependency.
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(705) };
+		e.waiting_on
+			.insert(Gate::InodeWritten(ino), vec![DepId(9999)]);
+		assert!(
+			e.validate().iter().any(|p| p.contains("case F")),
+			"{:?}",
+			e.validate()
+		);
+	}
+
+	/// Case B: waiting under its own gate, with the gate open.  That is the
+	/// shape that would mean "the gate opened and nobody published it", and it is
+	/// the one worth being able to recognise.
+	#[test]
+	fn registration_invariant_reports_an_open_gate_with_a_waiter() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(706) };
+		let id = e.new_inode(ino, crate::geom::CgNum::new(0));
+		e.gate(
+			&mut cache,
+			DepKind::DirectoryAdd,
+			4,
+			0,
+			8,
+			Gate::InodeWritten(ino),
+		)
+		.unwrap();
+		e.note_inode_bitmap_written(id).unwrap();
+		e.note_inode_written(id).unwrap();
+		assert!(
+			e.unresolved().eq(&0),
+			"publishing removed it from waiting, as it should"
+		);
+	}
+
+	/// Both orderings, for both gate families: the dependency may be created
+	/// before its gate opens, or after it is already open.
+	#[test]
+	fn both_orderings_resolve_for_both_gate_families() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+
+		// Allocation gate, dependency first.
+		let alloc = e.new_block(100, crate::geom::CgNum::new(0));
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectPointer,
+				4,
+				0,
+				8,
+				Gate::AllocationSafe(alloc),
+			)
+			.unwrap();
+		assert!(!e.is_resolved(d), "the allocation is not ready yet");
+		e.note_bitmap_written(alloc).unwrap();
+		e.note_contents_written(alloc).unwrap();
+		assert!(e.is_resolved(d), "both halves landed");
+		assert!(e.validate().is_empty());
+
+		// Allocation gate, dependency after the gate is already open.
+		let alloc = e.new_block(200, crate::geom::CgNum::new(0));
+		e.note_bitmap_written(alloc).unwrap();
+		e.note_contents_written(alloc).unwrap();
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectPointer,
+				4,
+				8,
+				8,
+				Gate::AllocationSafe(alloc),
+			)
+			.unwrap();
+		assert!(e.is_resolved(d), "gate() must publish an already-open gate");
+		assert!(e.validate().is_empty());
+
+		// Inode gate, dependency first.
+		let inr = unsafe { InodeNum::new(800) };
+		let i = e.new_inode(inr, crate::geom::CgNum::new(0));
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				16,
+				4,
+				Gate::InodeWritten(inr),
+			)
+			.unwrap();
+		assert!(!e.is_resolved(d));
+		e.note_inode_bitmap_written(i).unwrap();
+		assert!(!e.is_resolved(d), "the image has not landed");
+		e.note_inode_written(i).unwrap();
+		assert!(e.is_resolved(d));
+		assert!(e.validate().is_empty());
+
+		// Inode gate, dependency after the gate is already open.
+		let inr = unsafe { InodeNum::new(801) };
+		let i = e.new_inode(inr, crate::geom::CgNum::new(0));
+		e.note_inode_bitmap_written(i).unwrap();
+		e.note_inode_written(i).unwrap();
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				20,
+				4,
+				Gate::InodeWritten(inr),
+			)
+			.unwrap();
+		assert!(e.is_resolved(d), "gate() must publish an already-open gate");
+		assert!(e.validate().is_empty());
+	}
+
+	/// The full allocation lifecycle, ending with the allocation retired.
+	///
+	/// Retirement is where a `Gate::AllocationSafe(DepId)` can no longer tell
+	/// "not ready" from "already done": both look like an absent `NewBlockDep`.
+	/// This test documents that, and the one after it says what follows from it.
+	#[test]
+	fn the_full_allocation_lifecycle() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let alloc = e.new_block(100, crate::geom::CgNum::new(0));
+		assert_eq!(e.allocation_state(alloc), Some(AllocationState::New));
+
+		let d = e
+			.gate(
+				&mut cache,
+				DepKind::DirectPointer,
+				4,
+				0,
+				8,
+				Gate::AllocationSafe(alloc),
+			)
+			.unwrap();
+		e.note_bitmap_written(alloc).unwrap();
+		e.note_contents_written(alloc).unwrap();
+		assert!(e.is_resolved(d));
+
+		e.note_pointer_published(alloc).unwrap();
+		assert!(
+			!e.new_blocks.contains_key(&alloc),
+			"a completed allocation is retired"
+		);
+		assert!(!e.gate_is_open(Gate::AllocationSafe(alloc)));
+		assert!(e.validate().is_empty());
+	}
+
+	/// The lifecycle hole that retirement leaves, stated as a fact rather than a
+	/// fix.
+	///
+	/// A retired allocation and an allocation that has not started both look
+	/// like "the gate is shut" to `gate_is_open`.  That is harmless while every
+	/// dependency is created before its allocation completes -- which is the
+	/// order `Ufs` uses -- and wrong the moment one is created afterwards.  This
+	/// test pins the behaviour so that changing it has to be a deliberate act.
+	#[test]
+	fn a_retired_allocation_looks_the_same_as_an_unstarted_one() {
+		let (mut e, _cache, _dev) = setup();
+
+		// Never started: shut.
+		let never = e.new_block(1, crate::geom::CgNum::new(0));
+		assert!(!e.gate_is_open(Gate::AllocationSafe(never)));
+		assert!(e.new_blocks.contains_key(&never));
+
+		// Started, completed and retired: also shut.
+		let done = e.new_block(2, crate::geom::CgNum::new(0));
+		e.note_bitmap_written(done).unwrap();
+		e.note_contents_written(done).unwrap();
+		e.note_pointer_published(done).unwrap();
+		assert!(
+			!e.new_blocks.contains_key(&done),
+			"the completed allocation is retired"
+		);
+		assert!(
+			!e.gate_is_open(Gate::AllocationSafe(done)),
+			"a retired allocation is indistinguishable from an unstarted one"
+		);
+	}
+
+	/// A gate on a retired allocation is refused rather than accepted.
+	///
+	/// `note_pointer_published` removes a completed `NewBlockDep`, after which a
+	/// retired allocation and one that never started are indistinguishable: both
+	/// are simply absent from `new_blocks`, so `gate_is_open` says "shut" for
+	/// both.  A dependency created in that window would be held back for the life
+	/// of the mount.
+	///
+	/// `Ufs` cannot reach that window -- it creates a pointer dependency before
+	/// the allocation can complete -- but nothing in the engine enforced that,
+	/// so a future change to the ordering would have produced a hang rather
+	/// than an error.  Refusing turns it into an error at the point of the
+	/// mistake.
+	#[test]
+	fn a_gate_on_a_retired_allocation_is_refused() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+
+		// Retire an allocation: allocate it, make it safe, publish its pointer.
+		let alloc = e.new_block(100, CgNum::new(0));
+		e.note_bitmap_written(alloc).unwrap();
+		e.note_contents_written(alloc).unwrap();
+		e.note_pointer_published(alloc).unwrap();
+		assert!(!e.new_blocks.contains_key(&alloc), "it is retired");
+
+		// A dependency on it now would never open.
+		let err = e
+			.gate(
+				&mut cache,
+				DepKind::DirectPointer,
+				4,
+				0,
+				8,
+				Gate::AllocationSafe(alloc),
+			)
+			.unwrap_err();
+		assert!(err.to_string().contains("retired"), "{err}");
+		assert_eq!(e.unresolved(), 0, "nothing was registered");
+		assert!(e.validate().is_empty(), "{:?}", e.validate());
+
+		// And a dependency on an inode that was never allocated, likewise.
+		let ino = unsafe { InodeNum::new(901) };
+		let err = e
+			.gate(
+				&mut cache,
+				DepKind::DirectoryAdd,
+				4,
+				0,
+				8,
+				Gate::InodeWritten(ino),
+			)
+			.unwrap_err();
+		assert!(err.to_string().contains("never registered"), "{err}");
+	}
+
+	/// A dependency that can never resolve has to be visible, or a range gated on
+	/// it is held back for the life of the mount with nothing saying why.
+	///
+	/// `Gate::InodeLinkCounted` has no producer today: it protects a counter, and
+	/// a counter cannot be byte-range gated.  Nothing in the filesystem raises it,
+	/// which is exactly why `validate()` has to name it if one ever does.
+	#[test]
+	fn a_dependency_that_can_never_resolve_is_reported() {
+		let (mut e, mut cache, mut dev) = setup();
+		cache.get(&mut dev, 4).unwrap();
+		let ino = unsafe { InodeNum::new(900) };
+		e.gate(
+			&mut cache,
+			DepKind::DirectoryRemove,
+			4,
+			0,
+			8,
+			Gate::InodeLinkCounted(ino),
+		)
+		.unwrap();
+		let problems = e.validate();
+		assert!(
+			problems.iter().any(|p| p.contains("nothing ever opens")),
+			"{problems:?}"
+		);
+		assert_eq!(e.unresolved(), 1, "the dependency is still waiting");
+		assert!(
+			cache.peek(4).unwrap().has_unsafe_ranges(),
+			"and the range is held"
+		);
 	}
 
 	/// An operation enqueued when its container is *already* on the disk is

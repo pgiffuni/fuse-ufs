@@ -2940,3 +2940,146 @@ mod inodereclaim_defer {
 		assert!(report.is_clean(), "{report:?}");
 	}
 }
+
+/// What a sync does and does not promise.
+///
+/// `sync_metadata()` drains everything it *can*.  That is not the same as
+/// being finished: a range gated on something no further sync will resolve is
+/// not going out however many times `sync()` is called.  These tests say which is
+/// which, so that neither claim is made by accident.
+#[cfg(test)]
+mod syncsem {
+	use super::*;
+	use crate::InodeNum;
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// A filesystem with nothing outstanding says so.
+	#[test]
+	fn a_freshly_synced_filesystem_is_drained() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-sy1");
+		ug.inode_write(inr, 0, &vec![1u8; 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+
+		let st = ug.metadata_status();
+		assert!(st.is_drained(), "not drained: {st:?}");
+	}
+
+	/// Mid-operation, work *is* outstanding and the status says so.  This is the
+	/// case a caller has to be able to tell apart from "finished", so it gets its
+	/// own test rather than being inferred from the others.
+	#[test]
+	fn work_in_flight_is_visible_before_the_sync() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-sy2");
+		ug.inode_write(inr, 0, &vec![1u8; 32768]).unwrap();
+
+		let st = ug.metadata_status();
+		assert!(
+			!st.is_drained(),
+			"mid-operation work should be visible: {st:?}"
+		);
+		assert!(st.dirty);
+		assert!(
+			st.unresolved > 0 || st.in_flight > 0,
+			"expected outstanding dependencies: {st:?}"
+		);
+
+		ug.sync_metadata().unwrap();
+		let after = ug.metadata_status();
+		assert!(after.is_drained(), "after a sync: {after:?}");
+	}
+
+	/// A create followed by an unlink leaves nothing runnable behind, even
+	/// though it queued two deferred frees on the way.
+	#[test]
+	fn a_sync_leaves_nothing_runnable() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-sy3");
+		ug.inode_write(inr, 0, &vec![1u8; 32768]).unwrap();
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-sy3")).unwrap();
+
+		let before = ug.metadata_status();
+		assert!(
+			before.pending > 0 || before.unresolved > 0,
+			"nothing was deferred: {before:?}"
+		);
+
+		ug.sync_metadata().unwrap();
+		let after = ug.metadata_status();
+		assert!(after.is_drained(), "{after:?}");
+		assert!(ug.dependencies().validate().is_empty());
+	}
+
+	/// Repeating a sync changes nothing, which is what "idempotent" means for a
+	/// drain.
+	#[test]
+	fn a_repeated_sync_is_a_no_op() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-sy4");
+		ug.inode_write(inr, 0, &vec![1u8; 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+		let before = ug.metadata_status();
+
+		for _ in 0..3 {
+			ug.sync_metadata().unwrap();
+		}
+		assert_eq!(
+			ug.metadata_status(),
+			before,
+			"a further sync changed something"
+		);
+	}
+
+	/// A sync on a read-only mount is a no-op rather than an error: nothing to
+	/// write and nothing to drain.
+	#[test]
+	fn a_read_only_mount_syncs_cleanly() {
+		let (_img, mut ug) = testutil::open_ro("ufs-little");
+		ug.sync_metadata().unwrap();
+		assert!(ug.metadata_status().is_drained());
+	}
+
+	/// A truncate queues many frees and must drain all of them.
+	#[test]
+	fn a_truncate_drains_every_freed_block() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-sy6");
+		let n = 20u64;
+		ug.inode_write(inr, 0, &vec![1u8; (n * 32768) as usize])
+			.unwrap();
+		ug.sync_metadata().unwrap();
+		let free0 = ug.superblock.cstotal.nbfree;
+
+		ug.inode_truncate(inr, 0).unwrap();
+		ug.sync_metadata().unwrap();
+		assert!(
+			ug.metadata_status().is_drained(),
+			"{:?}",
+			ug.metadata_status()
+		);
+		// Twenty data blocks and the indirect block that held them.
+		assert_eq!(
+			ug.superblock.cstotal.nbfree as u64,
+			free0 as u64 + n + 1,
+			"the truncate freed {n} blocks plus its indirect block, and none were \
+			 left queued"
+		);
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+}

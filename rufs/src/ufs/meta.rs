@@ -337,6 +337,50 @@ impl<R: Backend> Ufs<R> {
 	/// [`crate::buf::BufferCache::is_clean`] together describe a fully drained
 	/// filesystem, and reaching that from every operation is what the
 	/// dependency wiring is for.
+	/// Drain everything that can be drained, and report what could not be.
+	///
+	/// This is what shutdown should call.  It differs from
+	/// [`Self::sync_metadata`] only in what it does with work that is *not*
+	/// runnable -- a deferred free waiting on a container that only a later
+	/// operation will write -- which it refuses rather than drops.
+	///
+	/// Refusing is the point.  The alternative is to unmount with blocks queued
+	/// and nothing saying so, which is the one failure mode Soft Updates
+	/// exists to prevent: the queue simply vanishes, and whatever those frees
+	/// were protecting has already been forgotten.
+	pub fn shutdown(&mut self) -> IoResult<MetadataStatus> {
+		self.sync_metadata()?;
+		let st = self.metadata_status();
+		if !st.is_drained() {
+			// Do not error, and do not pretend: the caller decides.  Returning
+			// the status keeps that decision with whoever can act on it, rather
+			// than turning a diagnostic into a second failure mode.
+			log::error!("shutdown: metadata is still outstanding: {st:?}");
+		}
+		Ok(st)
+	}
+
+	/// What this filesystem has left to do, after a sync.
+	///
+	/// [`Self::sync_metadata`] drains everything it *can*.  That is not the same
+	/// as being finished, and a caller that needs the second claim -- shutdown,
+	/// or a test asserting quiescence -- has to ask here rather than infer it.
+	///
+	/// The distinction matters because the honest answer is often "not
+	/// everything": a range gated on an event only a later operation can produce
+	/// is not going out no matter how many further syncs run, and a `sync()` that
+	/// reports success while metadata sits unpublished forever is worse than one
+	/// that says so.
+	pub fn metadata_status(&self) -> MetadataStatus {
+		MetadataStatus {
+			dirty:      self.buf.dirty_count() > 0,
+			blocked:    self.blocked_inodes.len(),
+			unresolved: self.softdep.unresolved(),
+			pending:    self.deferred.len(),
+			in_flight:  self.softdep.in_flight(),
+		}
+	}
+
 	pub fn sync_metadata(&mut self) -> IoResult<()> {
 		if self.buf.dirty_count() == 0 && self.softdep.is_empty() {
 			return Ok(());
@@ -479,15 +523,23 @@ impl<R: Backend> Ufs<R> {
 		// count was waiting for.
 		self.release_inode_blocks();
 
-		// A directory removal is persistent once its block has been written *in
-		// full*.  A safe write-back leaves the block's other gated ranges behind,
-		// so it cannot be said to have removed this entry -- and saying so would
-		// let an inode be cleared while the disk still lists it.
-		if full {
-			let n = self.softdep.note_directory_block_written(blk);
-			if n > 0 {
-				log::trace!("note_block_written({blk}): {n} removal(s) persisted");
-			}
+		// A directory removal is persistent once its block has been written *at
+		// all*, safely or in full.
+		//
+		// Requiring a full write was wrong, and it deadlocked the whole removal
+		// chain: the block holding a removed entry is itself gated, because the
+		// entry's inode number is exactly the range a `DirectoryRemove` gate
+		// holds back.  So it is only ever written safely, the gate never
+		// opened, and the cleared inode stayed unpublished for the life of the
+		// mount.
+		//
+		// A safe write is enough: every gated range in that block is zeroed in the
+		// safe image, and each of those ranges is precisely a removal (or a
+		// pointer) that must not be followed.  Anything the block was *not* gated
+		// for went out too.
+		let n = self.softdep.note_directory_block_written(blk);
+		if n > 0 {
+			log::trace!("note_block_written({blk}): {n} removal(s) persisted");
 		}
 		Ok(())
 	}
@@ -524,6 +576,15 @@ impl<R: Backend> Ufs<R> {
 			.into_iter()
 			.filter(|c| self.softdep.container_is_persisted(*c))
 			.collect();
+		// Cheap enough to always run and worth it in a debug build: an invariant
+		// violation here would otherwise show up much later as metadata that is
+		// silently never published.
+		debug_assert!(
+			self.softdep.validate().is_empty(),
+			"soft updates dependency graph is inconsistent: {:?}",
+			self.softdep.validate()
+		);
+
 		let ops = self.deferred.take_runnable(|c| persisted.contains(&c));
 		for op in &ops {
 			log::trace!("drain_deferred: applying {}", op.label());
@@ -874,5 +935,44 @@ mod t {
 		ug.sync_metadata().unwrap();
 		ug.inode_read(InodeNum::ROOT, 0, &mut [0u8; 512]).unwrap();
 		ug.sync_metadata().unwrap();
+	}
+}
+
+/// What a filesystem has left to do after a sync.
+///
+/// Every field is zero in a filesystem that has nothing outstanding, which is
+/// the state a caller may assume the disk reflects in full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataStatus {
+	/// Buffers with unsaved changes.
+	pub dirty: bool,
+
+	/// Inode buffers held back by a whole-buffer dependency.
+	pub blocked: usize,
+
+	/// Dependencies created and not yet resolved.
+	///
+	/// Non-zero after a full drain means something waits on an event only a later
+	/// operation can produce: normal mid-operation, abnormal at shutdown.
+	pub unresolved: usize,
+
+	/// Deferred operations waiting for a container to be written.
+	pub pending: usize,
+
+	/// Allocations still short of publishable.
+	pub in_flight: usize,
+}
+
+impl MetadataStatus {
+	/// Whether nothing at all is outstanding.
+	///
+	/// This is the claim `sync()` cannot make on its own and a caller needs
+	/// before it may assume the image on the disk is the whole story.
+	pub fn is_drained(&self) -> bool {
+		!self.dirty &&
+			self.blocked == 0 &&
+			self.unresolved == 0 &&
+			self.pending == 0 &&
+			self.in_flight == 0
 	}
 }
