@@ -202,7 +202,50 @@ The gates that *are* wired -- `NewBlockDep`, `DirectPointer`,
 `IndirectPointer`, `DirectoryAdd`, `DirectoryRemove` -- all gate pointers or a
 directory entry's inode number, which is exactly the case zeroing is right for.
 
-### Still direct
+### Audit: every metadata mutation goes through the cache
+
+`rufs/src/ufs/` was searched for the raw write paths -- `Decoder::encode_at`,
+`write_at`, `fill_at`, `seek` -- and every hit classified.  The point is that
+there should be no surprises left here: a Soft Updates guarantee that depends on
+nobody remembering is not a guarantee.
+
+| site | class | why |
+|---|---|---|
+| `Ufs::update_sb()` | metadata, staged | `metadata_write(SBLOCK_UFS2, ..)` -- it *was* a direct write, and the crash-point suite found it (see below) |
+| `write_cg()`, `write_blkmap()`, `write_inomap()` | metadata, staged | all go through `metadata_write*` |
+| `write_inode()`, `inode_setup()`'s raw reads | metadata, staged | `metadata_read`/`metadata_write`/`metadata_fill_at` |
+| `write_pblock()`, `indir_get()`, `indir_set()` | metadata, staged | same |
+| `blk_free_now()`, `free_cg_inode_now()` | metadata, staged | same; they are the *effect* half of a deferred operation |
+| `inode_write_block()`, non-directory | **ordinary file data, direct** | by design -- see below |
+| `inode_write_block()`, directory | metadata, staged | `blocks_are_metadata()` routes it |
+| `dir.rs` `Decoder::new(Cursor::new(block), ..)` | in-memory | a `Cursor` over a block already copied out, not the device |
+| `Ufs::open()` `seek` | mount | reading the superblock |
+| `xattr.rs` | read-only | `iter_xattr`/`read_xattr`/`xattr_list`/`xattr_read`; there are no xattr writes to bypass anything |
+| `symlink.rs` | none | no direct write of any kind |
+| `alloctest.rs` | test-only | one deliberate direct write, to fabricate an inconsistent image for the checker |
+
+So the only metadata writer that reaches the device other than through the
+cache is **ordinary file data**, and that is deliberate:
+
+```text
+UFS metadata      -> BufferCache -> dependency engine -> writeback
+a file's bytes    -> the decoder, straight through
+```
+
+The kernel page cache is already buffering a file's data, two blocks of it have
+no ordering constraint relative to each other, and a second buffer layer would
+turn every FUSE writeback into an ordering question for no gain.  A *directory's*
+blocks are metadata and are routed through the cache -- that is what
+`blocks_are_metadata()` decides, and it is the distinction that makes
+`DirectoryAdd` and `DirectoryRemove` expressible at all.
+
+`update_sb()` was in this table as a bypass until the crash-point suite reported
+"fs_cstotal.cs_nbfree is 48 but the cylinder-group bitmaps hold 49": the
+superblock's totals are a summary of the cylinder groups, and writing them
+straight to the device let them move while the groups they summarise sat in a
+dirty buffer.  That is the kind of thing this audit is for.
+
+## Still direct
 
 | path | why |
 |---|---|
@@ -369,6 +412,97 @@ pointer, so its block is only ever written safely.
 lives in an inode block and its bitmap bit in a cylinder-group block, so the
 events are independent and either order is legal, exactly as for
 `NewBlockDep`.  `Gate::InodeWritten` opens on their conjunction.
+
+## 3.4 The dependencies, in one table
+
+Every dependency that exists, with what holds it back and how.  "Mechanism" is
+the interesting column: a byte-range gate, a whole-buffer hold-back, or a
+deferred operation, and the choice is forced by *what* is being protected.
+
+| dependency | producer | protected object | unsafe state it prevents | resolved by | mechanism | test |
+|---|---|---|---|---|---|---|
+| `NewBlockDep` | `blk_alloc_for` | block | a pointer to a block whose bitmap bit has landed but whose contents have not; either half alone | bitmap written, and contents written -- in either order | byte-range gates on the pointers that name it | `newblock::*` |
+| `DirectPointer` | `inode_set_block` | inode | an inode pointing at a block that is not safely allocated | `NewBlockDep` reaching publishable | byte-range gate on `di_ext[i]` | `directptr::*` |
+| `IndirectPointer` | `indir_set_gated`, `inode_set_block` | indirect block, inode | an indirect entry, or the inode pointer naming an indirect block, reaching disk before that block is safe | the target block's `NewBlockDep` | byte-range gate on the entry, or on `di_extb[k]` | `indirectptr::*` |
+| `DirectoryAdd` | `dir_newlink` | directory | an entry naming an inode whose bitmap bit is clear and whose image is not on the disk | `InodeDep` reaching namable | byte-range gate on `di_ino`, four bytes | `diradd::*` |
+| `InodeDep` | `hash_alloc_inode` | inode | treating an inode as namable before its image *and* its bitmap bit are on the disk | both, in either order | feeds `DirectoryAdd` | `diradd::*` |
+| `DirectoryRemove` | `dir_unlink`, `inode_free` | inode | a cleared inode on disk while a directory entry still names it | the directory block written in full | byte-range gate on the whole cleared inode | `dirremove::*` |
+| `MkdirParentDep` | `mkdir` | parent inode | a parent `nlink` counting a child directory whose entry is not yet on the disk | `Gate::DirectoryPersisted { parent, blk }` | **whole-buffer hold-back** | `mkdirdep::*` |
+| `FreeBlocksDep` | `blk_free` | block allocation state | a block returned to the free list while a pointer to it is still on the disk, so a later allocation hands it to somebody else | the container being written | **deferred operation** | `freeblocks::*` |
+| `InodeReclaim` | `free_cg_inode` | inode allocation state | an inode number released while a directory entry still names it, or `cs_ndir` moving without the bit | the inode's block being written | **deferred operation** | `inodereclaim_defer::*` |
+
+### Why the mechanism differs, dependency by dependency
+
+The three mechanisms are not interchangeable, and the reason is worth stating
+plainly because it is what makes the choice forced rather than a matter of taste.
+
+**Byte-range gating** holds a range back by *zeroing* it. That is exactly right
+for a pointer, because zero *is* the meaning of "no pointer here": the safe
+image still parses, still describes a valid structure, and simply does not refer
+to the object that is not ready. It is why the four pointer-shaped dependencies
+above use it and why a directory entry needs only its four `di_ino` bytes gated
+rather than the whole record.
+
+**Whole-buffer hold-back** writes nothing at all, so the device keeps its
+previous contents, which were consistent. That is sound for *any* content, which
+is why it is the answer for a counter: a zeroed `i_nlink` is a different and
+wrong number rather than a stale one. `MkdirParentDep` is the only dependency
+that can use it, and only because the buffer it protects is the parent's inode --
+not the thing being modified.
+
+**Deferred execution** is for a third case: when the object that must wait is
+*shared*. `FreeBlocksDep` and `InodeReclaim` protect a cylinder group, and a
+cylinder group holds every other allocation in it. Holding that back -- by
+either mechanism -- would freeze unrelated work, so the operation itself has to
+wait instead.
+
+A buffer hold-back is only correct when the buffer has no unrelated updates
+that ought to be allowed out. That is a property of *which* buffer, not of the
+mechanism, and it is the thing to check before reaching for it.
+
+## 3.5 What Soft Updates guarantees
+
+And, just as importantly, what it does not.
+
+**Guaranteed**, for a crash at any point:
+
+* No on-disk pointer reaches a block whose allocation bitmap bit has not landed.
+* No on-disk pointer reaches a block whose initialised contents have not landed.
+* No directory entry names an inode whose bitmap bit is clear or whose image is
+  not on the disk.
+* No cleared inode sits on the disk while a directory entry still names it.
+* No block or inode number has been returned to its free pool while a pointer to
+  it survives on the disk.
+* A parent's `nlink` never counts a child directory whose entry is not on the
+  disk.
+* Every cylinder-group counter agrees with its bitmap, and the superblock's
+  summaries agree with the cylinder groups, at every crash point.
+
+Those are checked by `Ufs::check_consistency()` after every crash point in
+`alloctest::crash`, which reopens the image and hands it to the fsck-shaped
+checker.
+
+**Not guaranteed, and deliberately out of scope at present:**
+
+* *Atomicity.*  Soft Updates is an ordering mechanism. A `rename` is not atomic,
+  and a crash in the middle of it leaves a legitimate intermediate state that
+  `fsck` completes rather than a transaction that rolls back.
+* *Everything `fsck` can repair.*  A crash may leave a link count that disagrees
+  with the tree, or an inode nothing reaches. Those are classified as
+  *incompleteness* rather than *contradiction* precisely because `fsck` pass 2
+  and pass 4 resolve them by trusting the tree. Closing the window needs
+  `InodeLinkCounted`, which is deferred work on a counter and so hits the same
+  wall `MkdirParentDep` did.
+* *Renaming.*  The destination-add and source-removal halves of a cross-directory
+  rename are not modelled separately. Today they cannot produce a contradiction,
+  because the only reachable state is the entry existing under the old name,
+  which is exactly what a crash before the rename would leave.
+* *Meta-devices and snapshotting.*  Nothing here has been thought about for
+  `UFS2RG`/`UFS2SB`; the metadata cache would need the same treatment and
+  currently has none.
+* *Any writer that is not `Ufs`.*  The guarantees are about this code path. A
+  write that bypasses the cache has no ordering (see the audit above; there
+  are none today).
 
 ## 4. What is not implemented
 
