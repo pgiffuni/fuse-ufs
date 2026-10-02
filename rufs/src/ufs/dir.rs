@@ -46,7 +46,10 @@ impl Header {
 		assert!(dname.len() <= UFS_MAXNAMELEN);
 		let mut name = [0u8; UFS_MAXNAMELEN + 1];
 		name[0..dname.len()].copy_from_slice(dname.as_bytes());
-		let reclen = ((4 + 2 + 1 + 1 + name.len() + 3) & !3) as u16;
+		// Sized from `dname`, not from `name`: the buffer is always
+		// `UFS_MAXNAMELEN + 1` bytes whatever the entry is called, so using it
+		// here gave every record the same oversized reclen.
+		let reclen = ((4 + 2 + 1 + 1 + dname.len() + 3) & !3) as u16;
 		Self {
 			inr,
 			reclen,
@@ -182,7 +185,20 @@ fn newlink_block(block: &mut [u8], mut entry: Header, config: Config) -> IoResul
 	loop {
 		let pos = file.pos()?;
 		let Ok(Some(mut hdr)) = Header::parse(&mut file) else {
-			break;
+			// End of the entries in this block: the rest is free.  Taking it is
+			// what lets the first entry land at the offset after `..` instead of
+			// forcing the directory to grow while most of the block is empty,
+			// and it gives the new entry the whole tail, so a later insert can
+			// split it -- which is how FreeBSD packs a block.
+			let rem = (DIRBLKSIZE as u64).saturating_sub(pos) as u16;
+			if rem < entry.minlen() {
+				return Ok(None);
+			}
+
+			file.seek(pos)?;
+			entry.reclen = rem;
+			entry.write(&mut file)?;
+			return Ok(Some(pos));
 		};
 		let minlen = hdr.minlen();
 		let rem = hdr.reclen - minlen;
@@ -198,8 +214,6 @@ fn newlink_block(block: &mut [u8], mut entry: Header, config: Config) -> IoResul
 		entry.write(&mut file)?;
 		return Ok(Some(pos));
 	}
-
-	Ok(None)
 }
 
 /// Remove the entry naming `name` from a directory block.
@@ -295,8 +309,17 @@ fn newdir(dinr: InodeNum, inr: InodeNum, config: Config) -> IoResult<[u8; DIRBLK
 	let mut file = Decoder::new(Cursor::new(&mut block as &mut [u8]), config);
 
 	let h_self = Header::new(inr, InodeType::Directory, OsStr::new("."));
-	let mut h_parent = Header::new(dinr, InodeType::Directory, OsStr::new(".."));
-	h_parent.reclen = (DIRBLKSIZE as u16) - h_self.reclen;
+	let h_parent = Header::new(dinr, InodeType::Directory, OsStr::new(".."));
+	// Both keep their natural size.  Giving `..` the whole remaining block --
+	// which is what this used to do -- makes it the last entry in the block,
+	// and the last entry in a block is the one `newlink_block()` splits to make
+	// room.  The first file added to a new directory would therefore be written
+	// *into* `..`, pushing it out of position 12 and leaving two `.`/`..`
+	// records in the listing.
+	//
+	// FreeBSD's `newdir()` keeps `.` at offset 0 and `..` immediately after it
+	// at their natural sizes, and packs the first real entry into the space
+	// that follows; `resources/ufs-little.img` has exactly that layout.
 	h_self.write(&mut file)?;
 	h_parent.write(&mut file)?;
 
@@ -902,7 +925,7 @@ impl<R: Backend> Ufs<R> {
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsStr;
+	use std::ffi::{OsStr, OsString};
 
 	use super::*;
 	use crate::testutil;
@@ -1091,6 +1114,168 @@ mod tests {
 			assert_eq!(entries[1].inr, root, "{name}: .. does not name the parent");
 			assert_eq!(entries[0].offset, 1);
 			assert_eq!(entries[1].offset, 2);
+		}
+	}
+
+	/// Every record in a directory's first block: (offset, inode, reclen, name).
+	fn first_block(
+		ug: &mut crate::Ufs<std::fs::File>,
+		dir: InodeNum,
+	) -> Vec<(usize, InodeNum, u16, OsString)> {
+		let mut blk = [0u8; DIRBLKSIZE];
+		ug.inode_read(dir, 0, &mut blk).unwrap();
+		let config = ug.file.config();
+		let mut out = Vec::new();
+		let mut off = 0usize;
+		while off < DIRBLKSIZE {
+			let mut file = Decoder::new(Cursor::new(&blk), config);
+			file.seek(off as u64).unwrap();
+			let Some(h) = Header::parse(&mut file).unwrap() else {
+				break;
+			};
+			out.push((off, h.inr, h.reclen, h.name().to_owned()));
+			off += usize::from(h.reclen);
+		}
+		out
+	}
+
+	/// A directory this driver creates has the layout FreeBSD's `newdir()`
+	/// gives one, and which `resources/ufs-little.img` demonstrates: `.` at
+	/// offset 0 and `..` immediately after it, each at its natural size, with
+	/// the first real entry packed into the space that follows.
+	///
+	/// Getting this wrong is silent, which is what makes it worth pinning.  An
+	/// earlier version gave `..` a reclen covering the rest of the block, and
+	/// that is exactly what marks a record as the last entry in the block --
+	/// the one `newlink_block()` splits to make room.  So the first file added
+	/// to a new directory was written into `..`, pushing it out of position 12
+	/// and leaving a directory that listed `.` twice with `..` in the middle.
+	#[test]
+	fn new_directory_has_the_freebsd_dot_entry_layout() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_rw(name);
+			let root = InodeNum::ROOT;
+			ug.mkdir(root, OsStr::new("laid"), 0o755, 0, 0).unwrap();
+			let dir = ug.dir_lookup(root, OsStr::new("laid")).unwrap();
+
+			let recs = first_block(&mut ug, dir);
+			assert_eq!(
+				recs[0],
+				(0, dir, 12, OsString::from(".")),
+				"{name}: . is not a 12-byte record at offset 0"
+			);
+			assert_eq!(
+				recs[1],
+				(12, root, 12, OsString::from("..")),
+				"{name}: .. is not a 12-byte record at offset 12"
+			);
+
+			// The first file packs into the space after `..`, rather than
+			// forcing the directory to grow while most of block 0 is empty.
+			// Enough to span several blocks, so the ordering this pins holds
+			// past the point where the directory has to grow.
+			let added = 32;
+			let made: Vec<String> = (0..added)
+				.map(|i| format!("file-{i:04}-padding-padding-padding"))
+				.collect();
+			for n in &made {
+				ug.mknod(dir, OsStr::new(n), InodeType::RegularFile, 0o644, 0, 0)
+					.unwrap();
+			}
+
+			// The dot entries are still at their offsets and still whole.
+			let recs = first_block(&mut ug, dir);
+			assert_eq!(
+				recs[0],
+				(0, dir, 12, OsString::from(".")),
+				"{name}: . moved"
+			);
+			assert_eq!(
+				recs[1],
+				(12, root, 12, OsString::from("..")),
+				"{name}: .. moved or was split"
+			);
+			assert_eq!(
+				recs[2].3.to_string_lossy(),
+				made[0],
+				"{name}: first file did not pack after .."
+			);
+
+			// And the listing is exactly the files, after `.` and `..`, each
+			// once -- the property that was silently false before.
+			let entries = ug.dir_entries(dir).unwrap();
+			let names: Vec<OsString> = entries.iter().map(|e| e.name.clone()).collect();
+			let mut want = vec![OsString::from("."), OsString::from("..")];
+			want.extend(made.iter().map(OsString::from));
+			assert_eq!(names, want, "{name}: listing is not what was created");
+		}
+	}
+
+	/// Growing, emptying and regrowing a directory leaves an image `fsck`
+	/// considers coherent.
+	///
+	/// The layout bug above was invisible to `check_consistency` and to every
+	/// name-based lookup, because the entry was still findable -- it was just
+	/// in the wrong place, and `..` had been split in two.  Only walking the
+	/// directory shows it.  This test therefore checks the listing *and* asks
+	/// `fsck`, because the two failures are independent.
+	#[test]
+	fn a_mutated_directory_stays_coherent() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_rw(name);
+			let root = InodeNum::ROOT;
+			ug.mkdir(root, OsStr::new("mutated"), 0o755, 0, 0).unwrap();
+			let dir = ug.dir_lookup(root, OsStr::new("mutated")).unwrap();
+
+			let named = |i: u32| format!("f{i:04}-padding-padding-padding");
+			for i in 0..40 {
+				ug.mknod(
+					dir,
+					OsStr::new(&named(i)),
+					InodeType::RegularFile,
+					0o644,
+					0,
+					0,
+				)
+				.unwrap();
+			}
+			// Remove a run from the middle and a run from the start, so the
+			// freed records are ones a later insert has to reuse.
+			for i in 0..10 {
+				ug.unlink(dir, OsStr::new(&named(i))).unwrap();
+			}
+			for i in 20..25 {
+				ug.unlink(dir, OsStr::new(&named(i))).unwrap();
+			}
+			// Refill with names that do not fit in what the removals freed, so
+			// the tail has to be taken as well as any hole.
+			for i in 100..130 {
+				ug.mknod(
+					dir,
+					OsStr::new(&named(i)),
+					InodeType::RegularFile,
+					0o644,
+					0,
+					0,
+				)
+				.unwrap();
+			}
+			ug.sync_metadata().unwrap();
+
+			let entries = ug.dir_entries(dir).unwrap();
+			let mut got: Vec<String> = entries[2..]
+				.iter()
+				.map(|e| e.name.to_string_lossy().into_owned())
+				.collect();
+			got.sort();
+			let mut want: Vec<String> = (10..20).chain(25..40).chain(100..130).map(named).collect();
+			want.sort();
+			assert_eq!(got, want, "{name}: listing is not what was left");
+			assert_eq!(entries[0].name, OsStr::new("."));
+			assert_eq!(entries[1].name, OsStr::new(".."));
+
+			let rep = ug.check_consistency().unwrap();
+			assert!(rep.is_clean(), "{name}: {}", rep.summary());
 		}
 	}
 

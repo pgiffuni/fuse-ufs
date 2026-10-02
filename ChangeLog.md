@@ -30,6 +30,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fix
 
+- A directory this driver created was not laid out the way FreeBSD lays one
+  out, and the entries in it were silently misordered.  `newdir()` gave `..` a
+  reclen covering the rest of the block -- which is what marks a record as the
+  last entry in a block, and the last entry is the one split to make room for
+  a new one.  So the first file added to a new directory was written *into*
+  `..`, pushing it out of position 12, and the directory then listed `.` twice
+  with `..` in the middle.  `..` now keeps its natural size and the first real
+  entry packs into the space after it, which is the layout
+  `resources/ufs-little.img` has.
+- `Header::new()` sized a record from the length of the 256-byte name buffer
+  rather than the name in it, so every record it created got the same oversized
+  reclen regardless of how long its name was.
 - A directory with more entries than fit in one reply was silently truncated:
   `readdir` answered any non-zero offset with an empty listing, so the second
   and subsequent requests -- exactly the ones a kernel makes to read past a
