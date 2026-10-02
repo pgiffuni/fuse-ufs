@@ -505,6 +505,15 @@ checker.
   implementation that does not make the rename atomic has such a window, which
   is what FreeBSD's `fsck` pass 4 exists for.  `check_consistency()` classifies
   it as an *incompleteness* for that reason, in both directions.
+* *A truncate frees before it stages the pointer removal.*  `inode_shrink`
+  drops the pointers and frees the blocks inside itself, and `inode_truncate`
+  writes the shrunken inode afterwards.  The free's container is the inode
+  block, so whether it can run immediately depends on whether that block
+  happened to be clean at the time -- and after a `sync_metadata()` it is,
+  which is the common case.  Writing the inode first is not the fix: an inode
+  whose `i_size` is smaller than its block map supports is a *different*
+  inconsistency.  The fix is for `inode_shrink` to collect the blocks it drops
+  and let `inode_truncate` free them once the shrunken inode is staged.
 * *Meta-devices and snapshotting.*  Nothing here has been thought about for
   `UFS2RG`/`UFS2SB`; the metadata cache would need the same treatment and
   currently has none.

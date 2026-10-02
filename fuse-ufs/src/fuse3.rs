@@ -54,7 +54,30 @@ impl Filesystem for Fs {
 		Ok(())
 	}
 
-	fn destroy(&mut self) {}
+	/// Drain before the filesystem goes away.
+	///
+	/// This is the hook the kernel sends on unmount, and it is the right place to
+	/// drain: `Drop` is a backstop for the paths that never reach here, but the
+	/// kernel has already told us the filesystem is about to become unreachable,
+	/// and "clean unmount" means the last write happened before the unmount
+	/// rather than after it.
+	///
+	/// There is no error to return, so a drain that cannot finish is logged
+	/// rather than reported.  What must not happen is passing over it quietly.
+	fn destroy(&mut self) {
+		if !self.rw {
+			return;
+		}
+		match self.ufs.shutdown() {
+			Ok(st) if st.is_drained() => log::debug!("unmount: metadata drained"),
+			Ok(st) => {
+				log::error!(
+					"unmount: metadata is still outstanding and has NOT been written: {st:?}"
+				)
+			}
+			Err(e) => log::error!("unmount: drain failed, metadata may be incomplete: {e}"),
+		}
+	}
 
 	fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: fuser::ReplyAttr) {
 		let f = || {

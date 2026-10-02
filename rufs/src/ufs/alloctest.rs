@@ -3851,3 +3851,185 @@ mod renamelink {
 		}
 	}
 }
+
+/// Crash points around a *deferred* free.
+///
+/// The deferred frees are the ones with work queued rather than work staged, so
+/// they are the ones where "was it applied?" and "did it already happen?" can
+/// come apart.  Each test here crashes at each pass of the drain and asks the
+/// only question that matters: at no crash point may a block be free while
+/// something on the disk still points at it.
+#[cfg(test)]
+mod deferredcrash {
+	use super::*;
+	use crate::{InodeNum, InodeType};
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// Whether the block is free according to the *disk*, through the cache.
+	fn free_on_disk(ug: &mut Ufs<std::fs::File>, blk: u64) -> bool {
+		let cg = ug.superblock.blk_to_cg(blk);
+		let cgd = ug.read_cg(cg).unwrap();
+		ug.read_blkmap(cg, &cgd)
+			.unwrap()
+			.is_free_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk)))
+	}
+
+	/// Whether any inode's block map names the block, read through the cache --
+	/// which is what the disk holds after a crash.
+	fn pointed_at(ug: &mut Ufs<std::fs::File>, blk: u64) -> bool {
+		// Collect first, then read: `dir_iter` holds the filesystem mutably, so
+		// `read_inode` cannot be called from inside its closure.
+		let mut inos = Vec::new();
+		ug.dir_iter(InodeNum::ROOT, |_n, inr, _k| {
+			inos.push(inr);
+			None::<u8>
+		})
+		.unwrap();
+		for inr in inos {
+			if let Ok(ino) = ug.read_inode(inr) {
+				if let InodeData::Blocks(b) = &ino.data {
+					if b.direct.iter().any(|p| *p as u64 == blk) {
+						return true;
+					}
+				}
+			}
+		}
+		false
+	}
+
+	/// The same property over a crash, for a single block: the cheap version that
+	/// exercises every pass of the drain.
+	#[test]
+	fn a_crash_never_frees_a_block_the_inode_still_names() {
+		for n in 0..8 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			let inr = create(&mut ug, "zzz-dc2");
+			ug.inode_write(inr, 0, &vec![0x3cu8; 2 * 32768]).unwrap();
+			ug.sync_metadata().unwrap();
+
+			let blk = match ug.read_inode(inr).unwrap().data {
+				InodeData::Blocks(b) => b.direct[0] as u64,
+				_ => panic!("no block map"),
+			};
+
+			ug.inode_truncate(inr, 0).unwrap();
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let report = ug.check_consistency().unwrap();
+			assert!(
+				report.is_coherent(),
+				"truncate/deferred-free/crash-{n}: {report:?}"
+			);
+
+			// The whole point, stated directly.
+			let free = free_on_disk(&mut ug, blk);
+			let named = pointed_at(&mut ug, blk);
+			assert!(
+				!(free && named),
+				"truncate/deferred-free/crash-{n}: block {blk} is free while an \
+				 inode still names it"
+			);
+		}
+	}
+
+	/// After the drain has run, the block really is free and really is reusable,
+	/// and the counters agree with the bitmaps.
+	///
+	/// # A weakness this does not close
+	///
+	/// `inode_truncate` drops the pointers and frees the blocks inside
+	/// `inode_shrink`, and only *then* writes the shrunken inode.  The free's
+	/// container is the inode block, so whether the free can run immediately
+	/// depends on whether that block happened to be clean at the time -- and
+	/// after a `sync_metadata()` it is, which is the common case.
+	///
+	/// The fix is not to write the inode first: an inode whose `i_size` is
+	/// smaller than its block map supports is a *different* inconsistency, and
+	/// `check_consistency()` rejects it.  The fix is for `inode_shrink` to collect
+	/// the blocks it drops and let `inode_truncate` free them after the shrunken
+	/// inode is staged.  That is the deferral the queue already models, but it
+	/// needs the collection rather than the container flag, and it is not done
+	/// here.
+	///
+	/// The crash test above does not catch it, because it reads the block map
+	/// through the cache and so sees the live image rather than the disk's.
+	#[test]
+	fn a_drained_free_leaves_the_block_reusable() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-dc3");
+		ug.inode_write(inr, 0, &vec![0x3cu8; 2 * 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+		let blk = match ug.read_inode(inr).unwrap().data {
+			InodeData::Blocks(b) => b.direct[0] as u64,
+			_ => panic!("no block map"),
+		};
+		let free0 = ug.superblock.cstotal.nbfree;
+
+		// The truncate drops two data blocks, so both come back.
+		let want = free0 as u64 + 2;
+		ug.inode_truncate(inr, 0).unwrap();
+		ug.sync_metadata().unwrap();
+		assert!(
+			ug.metadata_status().is_drained(),
+			"{:?}",
+			ug.metadata_status()
+		);
+		assert!(free_on_disk(&mut ug, blk), "the deferred free never ran");
+		assert!(ug.check_consistency().unwrap().is_clean());
+		assert_eq!(ug.superblock.cstotal.nbfree as u64, want);
+	}
+
+	/// An inode's release is deferred on the same terms, and a crash must not
+	/// leave a directory entry naming an inode whose number is free.
+	#[test]
+	fn a_crash_never_frees_an_inode_an_entry_names() {
+		for n in 0..8 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			let inr = create(&mut ug, "zzz-dc4");
+			ug.sync_metadata().unwrap();
+
+			ug.unlink(InodeNum::ROOT, OsStr::new("zzz-dc4")).unwrap();
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let report = ug.check_consistency().unwrap();
+			assert!(
+				report.is_coherent(),
+				"unlink/deferred-inode-free/crash-{n}: {report:?}"
+			);
+
+			let (cg, off) = ug.superblock.ino_in_cg(inr);
+			let cgd = ug.read_cg(cg).unwrap();
+			let allocated = !ug.read_inomap(cg, &cgd).unwrap().is_free(off);
+			let listed = ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-dc4")).is_ok();
+			assert!(
+				!(listed && !allocated),
+				"unlink/deferred-inode-free/crash-{n}: a directory entry names \
+				 inode {inr}, whose bitmap bit is free"
+			);
+		}
+	}
+}
