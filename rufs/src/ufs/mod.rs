@@ -25,7 +25,7 @@ use crate::{
 	decoder::{Config, Decoder},
 	geom::{AllocationSummary, CgNum},
 	policy::CgSums,
-	softdep::DependencyEngine,
+	softdep::{DeferredQueue, DependencyEngine},
 };
 
 /// (INTERNAL) Constructs an [`std::io::Error`] from an `errno`.
@@ -130,6 +130,12 @@ pub struct Ufs<R: Backend> {
 	/// See [`Self::block_inode_on_dir`].
 	blocked_inodes: Vec<(u64, u64, InodeNum)>,
 
+	/// Filesystem operations waiting for a dependency to resolve.
+	///
+	/// Distinct from [`Self::blocked_inodes`]: that holds *metadata* back, this
+	/// holds *operations* back.
+	deferred: DeferredQueue,
+
 	/// Soft Updates dependency graph.
 	///
 	/// Owns the gates: byte ranges of cached buffers that may not be persisted
@@ -186,6 +192,7 @@ impl<R: Backend> Ufs<R> {
 			cg_sums: CgSums::default(),
 			buf,
 			blocked_inodes: Vec::new(),
+			deferred: DeferredQueue::new(),
 			softdep: DependencyEngine::new(),
 		};
 		s.check()?;

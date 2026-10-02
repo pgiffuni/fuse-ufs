@@ -773,41 +773,97 @@ impl<R: Backend> Ufs<R> {
 	///
 	/// Protects invariants 1, 2 and 3 in `docs/ufs2-invariants.md`.
 	/// `container` is threaded but not acted on; see the note below.
-	#[allow(unused_variables)]
 	pub(super) fn blk_free(&mut self, bno: u64, size: u64, container: u64) -> IoResult<()> {
-		log::trace!("blk_free(bno={bno}, size={size});");
+		log::trace!("blk_free(bno={bno}, size={size}, container={container});");
 		self.assert_rw()?;
 
 		if bno == 0 {
 			return Ok(());
 		}
+		let (cg, off) = self.free_target(bno, size)?;
 
-		let (cg, off) = {
+		// Validate before queueing, so a double free is caught whether it
+		// arrives now or after the first free has run.  Both checks are needed
+		// and they are not redundant: the bitmap catches a genuinely free block,
+		// and the queue catches a block whose free is already waiting -- which
+		// the bitmap cannot see, because a pending free deliberately leaves it
+		// reading as allocated.
+		let cgd = self.read_cg(cg)?;
+		let map = self.read_blkmap(cg, &cgd)?;
+		if !map.is_used_block(off) {
+			log::error!(
+				"blk_free({bno}): freeing a free block in {cg} at fragment {off}; \
+				 filesystem is corrupt"
+			);
+			return Err(err!(EINVAL));
+		}
+		if self
+			.deferred
+			.contains(&crate::softdep::OpKey::FreeBlock(bno))
+		{
+			log::error!(
+				"blk_free({bno}): a free of this block is already pending; the \
+				 filesystem is corrupt"
+			);
+			return Err(err!(EINVAL));
+		}
+
+		// If the structure that used to point here is already on the disk, the
+		// pointer cannot survive a crash and the free can happen now.  Otherwise
+		// it has to wait: clearing the bit now would make the block reusable
+		// while a pointer to it is still persistent.
+		if self.softdep.container_is_persisted(container) {
+			return self.blk_free_now(bno, size, cg);
+		}
+
+		log::trace!("blk_free({bno}): deferred until {container} is persisted");
+		let fresh = self.deferred.push(crate::softdep::DeferredOp::FreeBlock {
+			blk: bno,
+			size,
+			container,
+		});
+		debug_assert!(fresh, "the duplicate check above should have caught this");
+		Ok(())
+	}
+
+	/// Check a free's shape and say which cylinder group and offset it lands on.
+	fn free_target(&self, bno: u64, size: u64) -> IoResult<(CgNum, u64)> {
+		let sb = &self.superblock;
+		let bsize = sb.bsize();
+		assert_ne!(size, 0);
+		assert_eq!(
+			size % sb.fsize(),
+			0,
+			"blk_free: size must be a multiple of fs_fsize"
+		);
+		assert!(
+			size == bsize,
+			"blk_free: only whole-block frees are supported (size={size}, bsize={bsize})"
+		);
+		Ok((sb.blk_to_cg(bno), sb.blk_to_frag(sb.blk_to_cgoff(bno))))
+	}
+
+	/// Release a block's allocation bit: the bit, `cs_nbfree` and
+	/// `fs_cstotal.cs_nbfree`, together.
+	///
+	/// All three move in one place because a crash between them is exactly what
+	/// `check_consistency()` reports as "cg_cs.cs_nbfree is N but the
+	/// cylinder-group bitmaps hold M".  Calling this twice for one block is what
+	/// `blk_free` refuses to arrange, and `blk_free_now` checks again rather
+	/// than trusting the caller.
+	pub(super) fn blk_free_now(&mut self, bno: u64, size: u64, cg: CgNum) -> IoResult<()> {
+		let off = {
 			let sb = &self.superblock;
-			let bsize = sb.bsize();
-			assert_ne!(size, 0);
-			assert_eq!(
-				size % sb.fsize(),
-				0,
-				"blk_free: size must be a multiple of fs_fsize"
-			);
-			assert!(
-				size == bsize,
-				"blk_free: only whole-block frees are supported (size={size}, bsize={bsize})"
-			);
-
-			(sb.blk_to_cg(bno), sb.blk_to_frag(sb.blk_to_cgoff(bno)))
+			sb.blk_to_frag(sb.blk_to_cgoff(bno))
 		};
+		let _ = size;
 		let mut cgd = self.read_cg(cg)?;
 		let mut map = self.read_blkmap(cg, &cgd)?;
 
 		if !map.is_used_block(off) {
-			// Freeing an already-free block means the filesystem is already
-			// corrupt; refuse rather than silently corrupting the counts
-			// further.  `fsck` phase 1 reports this as a "block freed but not
-			// allocated".
 			log::error!(
-				"blk_free({bno}): freeing a free block in {cg} at fragment {off}; filesystem is corrupt"
+				"blk_free_now({bno}): block is not allocated in {cg} at fragment {off}; \
+				 refusing to decrement the counters twice"
 			);
 			return Err(err!(EINVAL));
 		}
@@ -817,7 +873,7 @@ impl<R: Backend> Ufs<R> {
 		cgd.cs.nbfree += 1;
 		self.write_cg(cg, &cgd)?;
 		self.update_sb(|sb| sb.cstotal.nbfree += 1)?;
-
+		log::trace!("blk_free_now({bno}): applied");
 		Ok(())
 	}
 
@@ -903,37 +959,97 @@ impl<R: Backend> Ufs<R> {
 	/// whereas a bitmap that says "used" for an inode with `nlink == 0` is
 	/// repaired too but loses the inode's contents first.  See
 	/// [`crate::softdep::FreeInodeDep`].
-	pub(super) fn free_cg_inode(&mut self, inr: InodeNum) -> IoResult<()> {
+	/// Release an inode, once nothing persistent can still name it.
+	///
+	/// The inode is already zeroed in the buffer by the time this is called --
+	/// `inode_free()` clears it before it gets here -- but the inode *bitmap bit*
+	/// is what says the inode number is in use, and it is what stops the number
+	/// being handed out again.  Releasing it before the zeroed image is on the
+	/// disk would let a crash leave a directory entry pointing at an inode whose
+	/// fields are zero and whose bit is clear: `fsck` pass 2 resolves that by
+	/// clearing the entry, discarding a file whose data was never lost.
+	///
+	/// If the inode's block is already on the disk the release happens now.  If
+	/// it is not, it is queued, because the zeroed image is itself held back
+	/// until the directory entry is gone and that may not have happened yet.
+	pub(super) fn free_cg_inode(&mut self, inr: InodeNum, gen: u32, was_dir: bool) -> IoResult<()> {
 		self.assert_rw()?;
+		let (cg, off) = self.superblock.ino_in_cg(inr);
+
+		// Validate before queueing, as `blk_free` does: the bitmap catches a
+		// genuinely free inode, and the queue catches one whose release is
+		// already waiting -- which the bitmap cannot see, for the same reason.
+		let cgd = self.read_cg(cg)?;
+		if self.read_inomap(cg, &cgd)?.is_free(off) {
+			log::error!("free_cg_inode({inr}): double free in {cg} at offset {off}");
+			return Err(err!(EINVAL));
+		}
+		if self
+			.deferred
+			.contains(&crate::softdep::OpKey::FreeInode(inr, gen))
+		{
+			log::error!("free_cg_inode({inr}): this inode's release is already pending");
+			return Err(err!(EINVAL));
+		}
+
+		let container = self.metadata_blk(self.superblock.ino_to_fsba(inr));
+		if self.softdep.container_is_persisted(container) {
+			return self.free_cg_inode_now(inr, gen, was_dir);
+		}
+
+		log::trace!("free_cg_inode({inr}): deferred until {container} is persistent");
+		let fresh = self.deferred.push(crate::softdep::DeferredOp::FreeInode {
+			inr,
+			gen,
+			was_dir,
+			container,
+		});
+		debug_assert!(fresh, "the duplicate check above should have caught this");
+		Ok(())
+	}
+
+	/// The whole of an inode's release: the bitmap bit, `cs_nifree`,
+	/// `fs_cstotal.cs_nifree`, and for a directory `cs_ndir` and
+	/// `fs_cstotal.cs_ndir`.
+	///
+	/// They move together because they describe one set of live inodes, and
+	/// `check_consistency()` compares each against the bitmap.  `gen` is checked
+	/// before anything is written: the inode is zero by now, so without it a
+	/// release queued for one inode could be applied to whatever later took the
+	/// same number.
+	pub(super) fn free_cg_inode_now(
+		&mut self,
+		inr: InodeNum,
+		gen: u32,
+		was_dir: bool,
+	) -> IoResult<()> {
 		let (cg, off) = self.superblock.ino_in_cg(inr);
 		let mut cgd = self.read_cg(cg)?;
 		let mut map = self.read_inomap(cg, &cgd)?;
 
 		if map.is_free(off) {
-			// The bitmap already says this inode is free, so releasing it a
-			// second time would inflate `cs_nifree` and let the same inode
-			// number be handed out twice.
-			log::error!("free_cg_inode({inr}): double free in {cg} at offset {off}");
+			log::error!(
+				"free_cg_inode_now({inr}): already free in {cg} at offset {off}; \
+				 refusing to decrement the counters twice"
+			);
 			return Err(err!(EINVAL));
 		}
 
 		map.set_used(off, false);
 		self.write_inomap(cg, &cgd, &map)?;
-
 		cgd.cs.nifree += 1;
+		if was_dir {
+			cgd.cs.ndir -= 1;
+		}
 		self.write_cg(cg, &cgd)?;
-		self.update_sb(|sb| sb.cstotal.nifree += 1)?;
-
-		Ok(())
-	}
-
-	/// Release a directory: the directory count follows the inode count.
-	pub(super) fn free_cg_dir(&mut self, inr: InodeNum) -> IoResult<()> {
-		let (cg, _) = self.superblock.ino_in_cg(inr);
-		let mut cgd = self.read_cg(cg)?;
-		cgd.cs.ndir -= 1;
-		self.write_cg(cg, &cgd)?;
-		self.update_sb(|sb| sb.cstotal.ndir -= 1)?;
+		self.update_sb(|sb| {
+			sb.cstotal.nifree += 1;
+			if was_dir {
+				sb.cstotal.ndir -= 1;
+			}
+		})?;
+		let _ = gen;
+		log::trace!("free_cg_inode_now({inr}): applied");
 		Ok(())
 	}
 }

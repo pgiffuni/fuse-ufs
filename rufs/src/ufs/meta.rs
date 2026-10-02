@@ -375,12 +375,18 @@ impl<R: Backend> Ufs<R> {
 	/// Private because nothing outside the crash harness has a reason to stop
 	/// half way: a caller that wanted persistence wants [`Self::sync_metadata`].
 	pub(super) fn sync_metadata_one_pass(&mut self) -> IoResult<usize> {
+		// Deferred work first: a free performed now dirties a cylinder group
+		// that this same pass then writes, so draining before the write gets the
+		// release out in one pass instead of two.
+		let applied = self.drain_deferred()?;
 		self.softdep.publish_into(&mut self.buf);
 		let written = self.softdep.write_ready(&mut self.buf, &mut self.file)?;
 		for (blk, how) in &written {
 			self.note_block_written(*blk, *how)?;
 		}
-		Ok(written.len())
+		// An applied free counts as progress even if it dirtied nothing new, so
+		// the outer loop runs another pass and drains whatever it unblocked.
+		Ok(written.len() + applied)
 	}
 
 	/// Turn a completed write-back into the allocation events it made true.
@@ -499,6 +505,62 @@ impl<R: Backend> Ufs<R> {
 	/// image may go out as ordinary dirty metadata.
 	pub(super) fn removal_gate(&mut self, inr: InodeNum) -> Option<crate::softdep::Gate> {
 		self.softdep.removal_gate(inr)
+	}
+
+	/// Perform every deferred operation whose prerequisite has been persisted.
+	///
+	/// The drain point.  It is reached from the same place a crash harness's
+	/// one-pass variant reaches it, so a crash test and a real drain take the
+	/// same path -- which is the only way the crash tests mean anything.
+	///
+	/// Operations come out in [`crate::OpKey`] order and are performed in that
+	/// order.  Performing one dirties a cylinder group, which is ordinary
+	/// writeback work rather than more deferred work -- a free never *creates* a
+	/// deferred operation -- so the queue strictly shrinks and the loop
+	/// terminates.
+	pub(super) fn drain_deferred(&mut self) -> IoResult<usize> {
+		let persisted: Vec<u64> = self
+			.deferred_pending_containers()
+			.into_iter()
+			.filter(|c| self.softdep.container_is_persisted(*c))
+			.collect();
+		let ops = self.deferred.take_runnable(|c| persisted.contains(&c));
+		for op in &ops {
+			log::trace!("drain_deferred: applying {}", op.label());
+		}
+		for op in &ops {
+			self.apply_deferred(op)?;
+		}
+		Ok(ops.len())
+	}
+
+	/// Every container the deferred queue is waiting on, deduplicated.
+	fn deferred_pending_containers(&self) -> Vec<u64> {
+		self.deferred
+			.iter()
+			.map(|o| o.container())
+			.collect::<std::collections::BTreeSet<_>>()
+			.into_iter()
+			.collect()
+	}
+
+	/// Perform one operation.
+	///
+	/// Split out so that a drain and a retry share one definition of what an
+	/// operation *does*.
+	fn apply_deferred(&mut self, op: &crate::softdep::DeferredOp) -> IoResult<()> {
+		match op {
+			crate::softdep::DeferredOp::FreeBlock { blk, size, .. } => {
+				let cg = self.superblock.blk_to_cg(*blk);
+				self.blk_free_now(*blk, *size, cg)?;
+			}
+			crate::softdep::DeferredOp::FreeInode {
+				inr, gen, was_dir, ..
+			} => {
+				self.free_cg_inode_now(*inr, *gen, *was_dir)?;
+			}
+		}
+		Ok(())
 	}
 
 	/// Hold `parent`'s inode buffer back until the directory entry that

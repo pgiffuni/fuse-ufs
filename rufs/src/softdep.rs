@@ -645,7 +645,11 @@ impl DependencyEngine {
 	}
 
 	/// Whether `container`'s current contents are on the disk.
-	pub fn container_is_written(&self, container: u64) -> bool {
+	///
+	/// "Currently" is the operative word.  A container written earlier and
+	/// modified since is *not* persisted, which is what lets a deferred free
+	/// correctly conclude that a pointer removal is still outstanding.
+	pub fn container_is_persisted(&self, container: u64) -> bool {
 		self.written.contains(&container)
 	}
 
@@ -741,16 +745,32 @@ pub enum DeferredOp {
 		container: u64,
 	},
 
-	/// Release an inode's allocation bit.
+	/// Release an inode, and with it the cylinder group's idea of how many
+	/// inodes and directories are in use.
 	///
-	/// The same reasoning: the inode still reads as allocated until this runs,
-	/// because the directory entry naming it may still be on the disk.
+	/// The same reasoning as a block free: the inode still reads as allocated
+	/// until this runs, because the directory entry naming it may still be on
+	/// the disk.
+	///
+	/// The directory count is part of the operation rather than a second step.
+	/// `cs_ndir`, `cs_nifree` and the bitmap bit all describe the same set of
+	/// live inodes, and `check_consistency()` compares them against what the
+	/// bitmap holds.  Moving one without the others is exactly the contradiction
+	/// it reports, and after the inode is cleared there is nothing left to read
+	/// the kind from -- so it is recorded here, where it is still known.
 	FreeInode {
 		/// The inode.
 		inr: InodeNum,
 
 		/// `di_gen` at the time the reclaim was queued.
+		///
+		/// The inode is zeroed by the time this runs, so `gen` is the only thing
+		/// that distinguishes a reclaim of *this* inode from a reclaim of whatever
+		/// later took the same inode number.
 		gen: u32,
+
+		/// Whether the inode was a directory, and so counted in `cs_ndir`.
+		was_dir: bool,
 
 		/// The cache block holding the inode's cleared image.
 		container: u64,
@@ -1752,6 +1772,7 @@ mod deferred {
 		DeferredOp::FreeInode {
 			inr: unsafe { InodeNum::new(inr) },
 			gen,
+			was_dir: false,
 			container,
 		}
 	}

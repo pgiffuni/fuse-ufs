@@ -423,6 +423,7 @@ fn freeing_restores_the_counters() {
 	ug.unlink(dir, OsStr::new("zzz-inner")).unwrap();
 	assert!(ug.superblock.cstotal.nbfree < bfree0);
 	ug.rmdir(InodeNum::ROOT, OsStr::new("zzz-rm")).unwrap();
+	ug.sync_metadata().unwrap();
 
 	assert_eq!(
 		ug.superblock.cstotal.nbfree, bfree0,
@@ -466,6 +467,16 @@ fn truncate_releases_indirect_blocks() {
 	assert!(ug.superblock.cstotal.nbfree < bfree0 - 20);
 
 	ug.inode_truncate(inr, 0).unwrap();
+	// Every free is deferred: the inode and the indirect block that stopped
+	// pointing at those twenty blocks are not on the disk yet, so none of them
+	// may read as allocated.  The write consumed twenty data blocks and one
+	// indirect block.
+	assert_eq!(
+		ug.superblock.cstotal.nbfree,
+		bfree0 - 21,
+		"a block was released while something still pointed at it"
+	);
+	ug.sync_metadata().unwrap();
 	assert_eq!(
 		ug.superblock.cstotal.nbfree, bfree0,
 		"block counter not restored after truncate"
@@ -2267,32 +2278,137 @@ mod freeblocks {
 		}
 	}
 
-	/// Unlinking frees the block immediately, and the image stays
-	/// self-consistent -- which is why it is done this way rather than with a
-	/// gate that corrupts it.  See the module note above.
+	/// Unlinking queues the block's free, and the block still reads as
+	/// allocated until the inode that stopped pointing at it is on the disk.
+	///
+	/// A crash in that window leaves a persistent pointer to a block the bitmap
+	/// still calls *used* -- recoverable, since `fsck` sees an allocated block
+	/// the tree reaches -- rather than a pointer to a block the bitmap calls
+	/// *free*, which `fsck` would hand to somebody else while the old file went
+	/// on reading it.
 	#[test]
-	fn a_block_is_freed_immediately() {
+	fn a_block_stays_allocated_until_its_pointer_is_gone() {
 		let (img, mut ug) = testutil::open_rw("ufs-little");
 		let inr = create(&mut ug, "zzz-fb");
 		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
 		ug.sync_metadata().unwrap();
 		let blk = first_block(&mut ug, inr);
 		let cg = ug.superblock.blk_to_cg(blk);
+		let is_free = |ug: &mut Ufs<std::fs::File>| {
+			let cgd = ug.read_cg(cg).unwrap();
+			ug.read_blkmap(cg, &cgd)
+				.unwrap()
+				.is_free_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk)))
+		};
 
 		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-fb")).unwrap();
+		assert!(
+			!is_free(&mut ug),
+			"the free ran before the pointer was gone"
+		);
+
+		ug.sync_metadata().unwrap();
+		assert!(is_free(&mut ug), "the free never ran");
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// The crash scenario the mechanism exists for: at no crash point may the
+	/// block be free while the old inode still points at it.
+	#[test]
+	fn a_crash_never_leaves_a_free_block_still_pointed_at() {
+		for n in 0..6 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			let inr = create(&mut ug, "zzz-fbc");
+			ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
+			ug.sync_metadata().unwrap();
+			let blk = first_block(&mut ug, inr);
+			let cg = ug.superblock.blk_to_cg(blk);
+			ug.unlink(InodeNum::ROOT, OsStr::new("zzz-fbc")).unwrap();
+
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let report = ug.check_consistency().unwrap();
+			assert!(
+				report.is_coherent(),
+				"unlink/free-block/crash-{n}: {report:?}"
+			);
+
+			let cgd = ug.read_cg(cg).unwrap();
+			let free = ug
+				.read_blkmap(cg, &cgd)
+				.unwrap()
+				.is_free_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk)));
+			let pointer_survives = match ug.read_inode(inr) {
+				Ok(ino) => {
+					match ino.data {
+						InodeData::Blocks(b) => b.direct.iter().any(|p| *p as u64 == blk),
+						_ => false,
+					}
+				}
+				Err(_) => false,
+			};
+			assert!(
+				!(free && pointer_survives),
+				"unlink/free-block/crash-{n}: the block is free while the inode \
+				 still points at it"
+			);
+		}
+	}
+
+	/// Freeing the same block twice is caught whether the second request arrives
+	/// before or after the first free ran.
+	#[test]
+	fn a_double_free_is_refused() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-df");
+		ug.inode_write(inr, 0, &vec![0u8; 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+		let blk = first_block(&mut ug, inr);
+		let cg = ug.superblock.blk_to_cg(blk);
+
+		// Use the inode's own block as the container, and dirty it, so the first
+		// free defers.  The bitmap still says allocated, so only the queue can
+		// catch the second.
+		let container = ug.metadata_blk(ug.superblock.ino_to_fsba(inr));
+		ug.metadata_block_mut(container).unwrap().data_mut()[0] ^= 0xff;
+
+		ug.blk_free(blk, ug.superblock.bsize(), container).unwrap();
+		let e = ug
+			.blk_free(blk, ug.superblock.bsize(), container)
+			.unwrap_err();
+		assert_eq!(
+			e.raw_os_error(),
+			Some(libc::EINVAL),
+			"the queue missed the duplicate"
+		);
+
+		ug.sync_metadata().unwrap();
 		let cgd = ug.read_cg(cg).unwrap();
 		assert!(
 			ug.read_blkmap(cg, &cgd)
 				.unwrap()
 				.is_free_block(ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk))),
-			"the block is not free in the live image"
+			"the deferred free never ran"
 		);
 
-		ug.sync_metadata().unwrap();
-		drop(ug);
-
-		let mut ug = Ufs::open(img.path(), true).unwrap();
-		assert!(ug.check_consistency().unwrap().is_clean());
+		// And once it has run, the bitmap catches a third.
+		let e = ug
+			.blk_free(blk, ug.superblock.bsize(), container)
+			.unwrap_err();
+		assert_eq!(
+			e.raw_os_error(),
+			Some(libc::EINVAL),
+			"the bitmap missed the duplicate"
+		);
 	}
 
 	/// Truncating frees every block past the new size.
@@ -2706,5 +2822,121 @@ mod mkdirdep {
 			"creating a file must not hold the parent back"
 		);
 		ug.sync_metadata().unwrap();
+	}
+}
+
+/// `InodeReclaim`: an inode's bitmap bit may only go once nothing persistent can
+/// still name it.
+#[cfg(test)]
+mod inodereclaim_defer {
+	use super::*;
+	use crate::InodeNum;
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// Whether `inr`'s bitmap bit says it is allocated.
+	fn is_allocated(ug: &mut Ufs<std::fs::File>, inr: InodeNum) -> bool {
+		let (cg, off) = ug.superblock.ino_in_cg(inr);
+		let cgd = ug.read_cg(cg).unwrap();
+		!ug.read_inomap(cg, &cgd).unwrap().is_free(off)
+	}
+
+	/// Unlinking queues the inode's release, and the inode number stays allocated
+	/// until the drain.
+	#[test]
+	fn an_inode_number_stays_allocated_until_the_drain() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-ir1");
+		ug.sync_metadata().unwrap();
+		let nifree = ug.superblock.cstotal.nifree;
+
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ir1")).unwrap();
+		assert!(
+			is_allocated(&mut ug, inr),
+			"the inode number was released before the drain"
+		);
+		assert_eq!(
+			ug.superblock.cstotal.nifree, nifree,
+			"the counter moved early"
+		);
+
+		ug.sync_metadata().unwrap();
+		assert!(!is_allocated(&mut ug, inr), "the release never ran");
+		assert_eq!(ug.superblock.cstotal.nifree, nifree + 1);
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// The crash scenario: at no crash point may a directory entry name an
+	/// inode whose bitmap bit is clear.
+	#[test]
+	fn a_crash_never_leaves_an_entry_naming_a_free_inode() {
+		for n in 0..8 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			let inr = create(&mut ug, "zzz-ir2");
+			ug.sync_metadata().unwrap();
+			ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ir2")).unwrap();
+
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let report = ug.check_consistency().unwrap();
+			assert!(
+				report.is_coherent(),
+				"unlink/inode-reclaim/crash-{n}: {report:?}"
+			);
+
+			// If the name is still on the disk, the inode number must be too.
+			let still_listed = ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-ir2")).is_ok();
+			let (cg, off) = ug.superblock.ino_in_cg(inr);
+			let cgd = ug.read_cg(cg).unwrap();
+			let allocated = !ug.read_inomap(cg, &cgd).unwrap().is_free(off);
+			assert!(
+				!(still_listed && !allocated),
+				"unlink/inode-reclaim/crash-{n}: a directory entry names inode \
+				 {inr}, whose bitmap bit is free"
+			);
+		}
+	}
+
+	/// A directory's release moves `cs_ndir` with the bit, so the two cannot
+	/// drift and leave the checker reporting a count the bitmap does not hold.
+	#[test]
+	fn a_removed_directory_releases_its_count_with_its_bit() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-ir3"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		ug.sync_metadata().unwrap();
+		let cg = ug.superblock.ino_in_cg(inr).0;
+		let ndir = ug.read_cg(cg).unwrap().cs.ndir;
+
+		ug.rmdir(InodeNum::ROOT, OsStr::new("zzz-ir3")).unwrap();
+		ug.sync_metadata().unwrap();
+		assert_eq!(ug.read_cg(cg).unwrap().cs.ndir, ndir - 1);
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		let report = ug.check_consistency().unwrap();
+		assert!(report.is_clean(), "{report:?}");
 	}
 }

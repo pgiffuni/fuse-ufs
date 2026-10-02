@@ -319,8 +319,42 @@ admitting it.  `Ufs` mirrors the flag into the engine for
 `Gate::DirectoryPersisted` and `Gate::PointersRemoved`, which is where the byte
 layer and the dependency layer meet.
 
-The deferral wiring can be built on this now.  It has not been attempted since
-the fix.
+The deferral is built on it now.  `Ufs::blk_free()` splits into a decision and an
+effect:
+
+  * if the container's current contents are already on the disk, free now --
+    the pointer cannot survive a crash, so the block may go straight back;
+  * otherwise queue a `DeferredOp::FreeBlock`, and let the drain perform it.
+
+`blk_free_now()` holds all three effects of a free together -- the bitmap bit,
+`cs_nbfree` and `fs_cstotal.cs_nbfree` -- because a crash between them is
+exactly what `check_consistency()` reports as "cg_cs.cs_nbfree is N but the
+cylinder-group bitmaps hold M".
+
+The drain runs at the top of each `sync_metadata()` pass, so a free performed in
+pass *n* dirties a cylinder group that pass *n* then writes: one pass, not two.
+Applying an operation counts as progress even when it dirties nothing new, so the
+outer loop runs again and drains whatever it unblocked.
+
+`InodeReclaim` is the same shape on the inode side, with two things the block
+free did not have to think about.
+
+The directory count moves with the bitmap bit.  `cs_ndir`, `cs_nifree` and the
+bitmap all describe one set of live inodes and `check_consistency()` compares each
+against the bitmap, so releasing one without the others is exactly the
+contradiction it reports.  `free_cg_dir` used to be a second step after the
+release and could drift from it; it is now part of the operation, recorded as
+`was_dir`, because the inode is zero by the time the release runs and there is
+nothing left to read the kind from.
+
+The generation is the identity.  Inode numbers are reused, so a release queued
+for inode 14 must not be applied to whatever later takes number 14.  `inode_free()`
+captures `di_gen` before the clear zeroes it and the queued operation carries it.
+
+Both are tested through the filesystem rather than the queue directly: the inode
+number stays allocated until the drain, at no crash point does a directory entry
+name an inode whose bit is free, and a removed directory releases `cs_ndir`
+together with its bit.
 
 ### Two asymmetries worth remembering
 

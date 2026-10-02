@@ -411,6 +411,10 @@ impl<R: Backend> Ufs<R> {
 
 		// Now the inode itself.  `i_blocks` goes to zero first so that a crash
 		// between here and the bitmap clear leaves a self-consistent inode.
+		//
+		// `gen` is captured here because the clear below zeroes it, and it is the
+		// only thing left that identifies *this* inode.
+		let gen = ino.gen;
 		ino.blocks = 0;
 		self.write_inode(inr, &ino)?;
 
@@ -451,10 +455,16 @@ impl<R: Backend> Ufs<R> {
 			)?;
 		}
 
-		self.free_cg_inode(inr)?;
-		if is_dir {
-			self.free_cg_dir(inr)?;
-		}
+		// One operation releases the inode *and* the cylinder group's directory
+		// count, because they describe the same set of live inodes and
+		// `check_consistency()` compares each against the bitmap.  `free_cg_dir`
+		// was a second step here and could drift from the bit; it is now part of
+		// the release.
+		//
+		// `gen` is the inode's generation, captured before the clear above
+		// zeroed it.  It is the only thing that stops a release queued for this
+		// inode being applied to whatever later takes the same number.
+		self.free_cg_inode(inr, gen, is_dir)?;
 
 		Ok(())
 	}
