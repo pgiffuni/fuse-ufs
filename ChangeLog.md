@@ -21,9 +21,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a sparse region is skipped in one step.
 - `rufs`: `inode_seek_data()` and `inode_seek_hole()`.
 - `fuse-ufs`: `bmap`, and `lseek` for `SEEK_DATA`/`SEEK_HOLE`.
+- `fuse-ufs`: `READDIRPLUS`, on the FUSE3 backend.  A kernel that asks for it
+  gets a directory listing with attributes attached, instead of `ENOSYS` and a
+  `GETATTR` per entry.
+- `rufs`: `Ufs::dir_entries()`, a collecting form of `dir_iter` that numbers
+  each entry by its position.  `READDIR` and `READDIRPLUS` are both built from
+  it, so the two cannot disagree about what a directory contains.
 
 ### Fix
 
+- A directory with more entries than fit in one reply was silently truncated:
+  `readdir` answered any non-zero offset with an empty listing, so the second
+  and subsequent requests -- exactly the ones a kernel makes to read past a
+  full buffer -- returned nothing.  Offsets are now a property of the entry, so
+  a read resumes where the last one stopped.
 - A cylinder-group struct and its bitmaps share one `fs_bsize` block.  With the
   struct staged through the cache and the bitmaps still written straight to the
   device, the next write-back of that block rolled the bitmaps back: an

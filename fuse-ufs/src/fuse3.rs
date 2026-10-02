@@ -79,6 +79,65 @@ impl Filesystem for Fs {
 		}
 	}
 
+	/// `READDIRPLUS`: the same listing as [`Self::readdir`], with attributes.
+	///
+	/// Identical enumeration, so the two *cannot* disagree about which objects
+	/// are in the directory or what they are called.  The only difference is what
+	/// travels with each entry.
+	///
+	/// `fuser`'s default returns `ENOSYS`, which is what the driver did before
+	/// this, and what the kernel falls back to when it gets it -- so enabling
+	/// this changes no behaviour for a kernel that does not ask, and saves a
+	/// `GETATTR` per entry for one that does.
+	fn readdirplus(
+		&mut self,
+		_req: &Request<'_>,
+		inr: u64,
+		_fh: u64,
+		offset: i64,
+		mut reply: fuser::ReplyDirectoryPlus,
+	) {
+		let f = || {
+			let inr = transino(inr)?;
+			if offset < 0 {
+				return Err(err!(EINVAL));
+			}
+
+			for e in self.ufs.dir_entries(inr)? {
+				if e.offset <= offset {
+					continue;
+				}
+				// The attributes are read here rather than collected by
+				// `dir_iter` because reading an inode needs the filesystem
+				// mutably, and `dir_iter` is holding it.  Same object, same
+				// answer `getattr` would give -- it is the same call.
+				//
+				// A failure is logged and the entry skipped rather than failing
+				// the listing: `READDIRPLUS` is asking for extra detail, and one
+				// unreadable inode should not cost the caller the whole
+				// directory.  `READDIR` would have listed the entry regardless.
+				// The offset is already assigned and does not move, so skipping
+				// cannot desynchronise a later continuation.
+				let attr: FileAttr = match self.ufs.inode_attr(e.inr) {
+					Ok(attr) => attr.into(),
+					Err(err) => {
+						log::error!("readdirplus: {} {}: {err}", e.inr, e.name.to_string_lossy());
+						continue;
+					}
+				};
+				if reply.add(e.inr.get64(), e.offset, &e.name, &MAX_CACHE, &attr, 0) {
+					break;
+				}
+			}
+
+			Ok(())
+		};
+		match run(f) {
+			Ok(()) => reply.ok(),
+			Err(e) => reply.error(e),
+		}
+	}
+
 	fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: fuser::ReplyAttr) {
 		let f = || {
 			let inr = transino(ino)?;
@@ -101,7 +160,6 @@ impl Filesystem for Fs {
 		reply.opened(0, 0);
 	}
 
-	// TODO: use offset in a less stupid way
 	fn readdir(
 		&mut self,
 		_req: &Request<'_>,
@@ -112,19 +170,22 @@ impl Filesystem for Fs {
 	) {
 		let f = || {
 			let inr = transino(inr)?;
-			if offset != 0 {
-				return Ok(());
+			if offset < 0 {
+				return Err(err!(EINVAL));
 			}
 
-			let mut i = 0;
-
-			self.ufs.dir_iter(inr, |name, inr, kind| {
-				i += 1;
-				if i > offset && reply.add(inr.get64(), i, kind.into(), name) {
-					return Some(());
+			// Continuation used to be refused outright: a non-zero offset
+			// returned an empty reply, so a directory with more entries than fit
+			// in one buffer silently ended there.  The offset is now a property of
+			// the entry, so a second call resumes where the first stopped.
+			for e in self.ufs.dir_entries(inr)? {
+				if e.offset <= offset {
+					continue;
 				}
-				None
-			})?;
+				if reply.add(e.inr.get64(), e.offset, e.kind.into(), &e.name) {
+					break;
+				}
+			}
 
 			Ok(())
 		};

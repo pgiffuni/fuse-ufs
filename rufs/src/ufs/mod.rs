@@ -18,6 +18,8 @@ mod inode;
 mod symlink;
 mod xattr;
 
+pub use dir::DirEntry;
+
 use crate::{
 	blockreader::{Backend, BlockReader},
 	buf::BufferCache,

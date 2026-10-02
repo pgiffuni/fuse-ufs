@@ -13,6 +13,25 @@ use crate::{err, InodeNum};
 /// `fsck` cannot walk past.
 const DIRENT_INR_LEN: u64 = 4;
 
+/// One entry of a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+	/// The inode this entry names.
+	pub inr:    InodeNum,
+	/// Its type, as recorded in `direntry::di_type`.
+	pub kind:   InodeType,
+	/// Its name, owned: `dir_iter` lends names out of a block it reuses.
+	pub name:   std::ffi::OsString,
+	/// This entry's position in the listing, counting from 1.
+	///
+	/// Not an arbitrary cursor: it counts `.` and `..`, and it is stable for a
+	/// given directory, which is what lets a caller that filled one reply buffer
+	/// ask for the rest without having to re-derive where it stopped.  Assigning
+	/// it while enumerating, rather than after, is what keeps it from shifting
+	/// under a continuation.
+	pub offset: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Header {
 	inr:     InodeNum,
@@ -299,6 +318,31 @@ impl<R: Backend> Ufs<R> {
 			},
 		)?
 		.ok_or(err!(ENOENT))
+	}
+
+	/// Collect the whole listing of the directory `inr`.
+	///
+	/// The collecting form of [`Ufs::dir_iter`], for callers that cannot read a
+	/// directory entry and act on it within one `&mut self` borrow -- fetching an
+	/// inode's attributes while `dir_iter` holds the filesystem is the case that
+	/// motivates this.
+	///
+	/// The listing is built the same way for every caller, so callers that
+	/// differ only in what they report about each entry cannot disagree about
+	/// which entries exist.
+	pub fn dir_entries(&mut self, inr: InodeNum) -> IoResult<Vec<DirEntry>> {
+		let mut out = Vec::new();
+		self.dir_iter(inr, |name, inr, kind| -> Option<()> {
+			out.push(DirEntry {
+				inr,
+				kind,
+				// `name` borrows a block `dir_iter` is about to reuse.
+				name: name.to_os_string(),
+				offset: out.len() as i64 + 1,
+			});
+			None
+		})?;
+		Ok(out)
 	}
 
 	/// Iterate through a directory referenced by `inr`, and call `f` for each entry.
@@ -853,5 +897,257 @@ impl<R: Backend> Ufs<R> {
 
 		let ino = self.read_inode(inr)?;
 		Ok(ino.as_attr(inr))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::ffi::OsStr;
+
+	use super::*;
+	use crate::testutil;
+
+	const IMAGES: [&str; 2] = ["ufs-little", "ufs-big"];
+
+	/// What a kernel sees when it reads a directory through `READDIR`, and then
+	/// through `READDIRPLUS`, has to be one listing, not two that happen to
+	/// agree.  Both FUSE operations in `fuse3.rs` are built from this function,
+	/// so asserting that it agrees with `dir_iter` is what makes "they cannot
+	/// disagree" a checked claim rather than a comment.
+	#[test]
+	fn dir_entries_agrees_with_dir_iter() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_ro(name);
+
+			let mut streamed = Vec::new();
+			ug.dir_iter(InodeNum::ROOT, |n, inr, kind| -> Option<()> {
+				streamed.push((n.to_os_string(), inr, kind));
+				None
+			})
+			.unwrap();
+
+			let collected = ug.dir_entries(InodeNum::ROOT).unwrap();
+			let from_entries: Vec<_> = collected
+				.iter()
+				.map(|e| (e.name.clone(), e.inr, e.kind))
+				.collect();
+
+			assert_eq!(
+				from_entries, streamed,
+				"{name}: dir_entries diverged from dir_iter"
+			);
+			assert!(!collected.is_empty(), "{name}: empty root listing");
+		}
+	}
+
+	/// Offsets count from 1 and are contiguous.
+	///
+	/// The kernel resumes a partially-read directory by handing back the offset
+	/// of the last entry it received, so a gap or a duplicated value here
+	/// silently loses or repeats entries on a directory too large for one
+	/// reply -- and never on one that fits, which is why it is worth pinning.
+	#[test]
+	fn offsets_are_contiguous_and_one_based() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_ro(name);
+			let entries = ug.dir_entries(InodeNum::ROOT).unwrap();
+
+			for (i, e) in entries.iter().enumerate() {
+				assert_eq!(
+					e.offset,
+					i as i64 + 1,
+					"{name}: offset {} at index {i}",
+					e.offset
+				);
+			}
+		}
+	}
+
+	/// Replaying the kernel's loop -- fill a reply buffer, resume from the last
+	/// offset sent -- has to yield the whole listing exactly once, whatever the
+	/// buffer size.
+	///
+	/// This is the property the offsets exist for, and it is checked at page
+	/// sizes around the ones that actually straddle a directory block.
+	fn continuation_yields_everything_exactly_once(entries: &[DirEntry], page: usize) {
+		let mut got = Vec::new();
+		let mut cursor = 0i64;
+		loop {
+			let batch: Vec<_> = entries
+				.iter()
+				.filter(|e| e.offset > cursor)
+				.take(page)
+				.collect();
+			if batch.is_empty() {
+				break;
+			}
+			cursor = batch.last().unwrap().offset;
+			got.extend(batch.into_iter().cloned());
+		}
+		assert_eq!(got, entries, "continuation lost or duplicated entries");
+	}
+
+	#[test]
+	fn continuation_is_exhaustive_at_every_page_size() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_ro(name);
+			let entries = ug.dir_entries(InodeNum::ROOT).unwrap();
+			let n = entries.len();
+			for page in [1, 2, 3, 5, n, n + 1, 64] {
+				continuation_yields_everything_exactly_once(&entries, page);
+			}
+		}
+	}
+
+	/// Reading a directory twice gives the same thing.
+	///
+	/// Offsets are only usable as cursors if they do not change between reads;
+	/// if they did, a kernel resuming a read would skip or repeat entries.
+	#[test]
+	fn offsets_are_stable_across_reads() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_ro(name);
+			let a = ug.dir_entries(InodeNum::ROOT).unwrap();
+			let b = ug.dir_entries(InodeNum::ROOT).unwrap();
+			assert_eq!(a, b, "{name}: listing changed between identical reads");
+		}
+	}
+
+	/// `.` and `..` come first, name the directory and its parent, and are
+	/// directories themselves.
+	#[test]
+	fn dot_entries_lead_the_listing() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_ro(name);
+			let entries = ug.dir_entries(InodeNum::ROOT).unwrap();
+
+			let dot = &entries[0];
+			let dotdot = &entries[1];
+			assert_eq!(dot.name, OsStr::new("."));
+			assert_eq!(dotdot.name, OsStr::new(".."));
+			assert_eq!(
+				dot.kind,
+				InodeType::Directory,
+				"{name}: . is not a directory"
+			);
+			assert_eq!(
+				dotdot.kind,
+				InodeType::Directory,
+				"{name}: .. is not a directory"
+			);
+			assert_eq!(
+				dot.inr,
+				InodeNum::ROOT,
+				"{name}: . does not name the directory"
+			);
+			assert_eq!(
+				dotdot.inr,
+				InodeNum::ROOT,
+				"{name}: .. does not name the parent"
+			);
+		}
+	}
+
+	/// Every entry names something that exists, with the type the directory
+	/// records -- the claim `READDIRPLUS` makes about the whole listing.
+	#[test]
+	fn every_entry_names_an_inode_of_that_type() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_ro(name);
+			let entries = ug.dir_entries(InodeNum::ROOT).unwrap();
+
+			for e in &entries {
+				let ino = ug.read_inode(e.inr).unwrap();
+				assert_eq!(
+					ino.kind(),
+					e.kind,
+					"{name}: {} is recorded as {:?} but is {:?}",
+					e.name.to_string_lossy(),
+					e.kind,
+					ino.kind()
+				);
+			}
+		}
+	}
+
+	/// A new directory holds `.` and `..` and nothing else, and they name the
+	/// right places.
+	#[test]
+	fn empty_directory_holds_only_dot_entries() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_rw(name);
+			let root = InodeNum::ROOT;
+			ug.mkdir(root, OsStr::new("empty"), 0o755, 0, 0).unwrap();
+			let dir = ug.dir_lookup(root, OsStr::new("empty")).unwrap();
+
+			let entries = ug.dir_entries(dir).unwrap();
+			assert_eq!(entries.len(), 2, "{name}: {entries:?}");
+			assert_eq!(entries[0].name, OsStr::new("."));
+			assert_eq!(entries[1].name, OsStr::new(".."));
+			assert_eq!(
+				entries[0].inr, dir,
+				"{name}: . does not name the new directory"
+			);
+			assert_eq!(entries[1].inr, root, "{name}: .. does not name the parent");
+			assert_eq!(entries[0].offset, 1);
+			assert_eq!(entries[1].offset, 2);
+		}
+	}
+
+	/// The case the golden image cannot cover: a directory spanning several
+	/// UFS directory blocks.
+	///
+	/// `DIRBLKSIZE` is 512, and each entry costs its name plus an 8-byte header,
+	/// so long names reach a second block in a handful of entries.  The seam is
+	/// where an offset computed per-block instead of per-listing would go wrong,
+	/// which is why the continuation is replayed at page sizes around it.
+	#[test]
+	fn multi_block_directory_numbers_continuously_across_the_seam() {
+		for name in IMAGES {
+			let (_img, mut ug) = testutil::open_rw(name);
+			let root = InodeNum::ROOT;
+			ug.mkdir(root, OsStr::new("many"), 0o755, 0, 0).unwrap();
+			let dir = ug.dir_lookup(root, OsStr::new("many")).unwrap();
+
+			// Enough to spill well past one 512-byte block.
+			let entries_added = 32;
+			for i in 0..entries_added {
+				let name_ = format!("{i:04}-a-name-long-enough-to-fill-the-block");
+				ug.mknod(dir, OsStr::new(&name_), InodeType::RegularFile, 0o644, 0, 0)
+					.unwrap();
+			}
+
+			let size = ug.read_inode(dir).unwrap().size;
+			assert!(
+				size > DIRBLKSIZE as u64,
+				"{name}: directory is {size} bytes, not multi-block"
+			);
+
+			let entries = ug.dir_entries(dir).unwrap();
+			assert_eq!(
+				entries.len(),
+				entries_added + 2,
+				"{name}: wrong entry count"
+			);
+			for (i, e) in entries.iter().enumerate() {
+				assert_eq!(e.offset, i as i64 + 1, "{name}: offset gap at {i}");
+			}
+
+			// Page sizes around the block size, so the boundary is exercised
+			// from both sides.
+			for page in [1, 3, 6, 7, 8, 15, 34] {
+				continuation_yields_everything_exactly_once(&entries, page);
+			}
+
+			// Resuming from an offset that is not the last one handed out --
+			// a kernel restarting a read part way -- yields the strict suffix.
+			let mid = 5;
+			let suffix: Vec<_> = entries.iter().filter(|e| e.offset > mid).cloned().collect();
+			assert_eq!(suffix.len(), entries.len() - mid as usize);
+			assert_eq!(suffix[0].offset, mid + 1);
+			assert!(entries
+				.iter()
+				.all(|e| e.offset <= mid || suffix.contains(e)));
+		}
 	}
 }
