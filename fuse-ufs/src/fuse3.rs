@@ -319,7 +319,7 @@ impl Filesystem for Fs {
 			let inr = transino(inr)?;
 
 			if let Some(size) = size {
-				self.ufs.inode_truncate(inr, size)?;
+				self.ufs.truncate(inr, size)?;
 			}
 
 			let f = |mut attr: InodeAttr| {

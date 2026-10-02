@@ -621,7 +621,35 @@ impl<R: Backend> Ufs<R> {
 		Ok(())
 	}
 
-	pub fn inode_truncate(&mut self, inr: InodeNum, new_size: u64) -> IoResult<()> {
+	/// Truncate `inr` to `new_size` bytes.
+	///
+	/// This is the operation `truncate(2)` and `ftruncate(2)` map onto, so it
+	/// enforces what POSIX requires of them.  The machinery below does not:
+	/// `mkdir` sizes the directory it just created through
+	/// [`Self::inode_truncate`], and must keep being able to.
+	pub fn truncate(&mut self, inr: InodeNum, new_size: u64) -> IoResult<()> {
+		log::trace!("truncate({inr}, {new_size});");
+		self.assert_rw()?;
+
+		if self.read_inode(inr)?.kind() == InodeType::Directory {
+			// `EISDIR`, and here the wrong errno would be the smaller half of the
+			// bug: truncating a directory to zero frees the blocks holding its
+			// `.` and `..`, which are how the directory is found at all.  Found by
+			// the randomised test, seed 12: `mkdir` followed by `truncate` left a
+			// directory whose `.` named seven unrelated inodes, because its first
+			// block had been handed back out and read as a directory.
+			log::warn!("truncate({inr}): a directory cannot be truncated");
+			return Err(err!(EISDIR));
+		}
+
+		self.inode_truncate(inr, new_size)
+	}
+
+	/// Resize `inr`, with no restriction on what it is.
+	///
+	/// Not the same as [`Self::truncate`]: this is the primitive, and `mkdir`
+	/// uses it to give a new directory its first block.
+	pub(super) fn inode_truncate(&mut self, inr: InodeNum, new_size: u64) -> IoResult<()> {
 		log::trace!("inode_truncate({inr}, {new_size});");
 		self.assert_rw()?;
 

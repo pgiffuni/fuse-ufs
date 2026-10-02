@@ -536,6 +536,47 @@ a counter, and a counter cannot be byte-range gated -- so a range gated on it
 would be held back for the life of the mount.  Nothing raises it today, and
 `validate()` says so if one ever does.
 
+## 3.7 Found by the randomised test
+
+The property test in `rufs/src/ufs/alloctest.rs::random` runs fixed seeds of
+randomised operation sequences with a crash injected at a deterministic point,
+and asserts two invariants: **coherence** at every crash point, and
+**drained** after a complete sync.  It has paid for itself twice.
+
+**`truncate` on a directory** (seed 12).  `inode_truncate` had no kind check, so
+truncating a directory to zero freed the blocks holding its `.` and `..` -- which
+are how the directory is found at all.  The checker then read a freed and
+reallocated block as a directory and reported seven entries all named `.`, which
+is where the original, baffling symptom came from.  `Ufs::truncate()` now
+enforces `EISDIR` and both FUSE backends go through it; `inode_truncate` remains
+the unrestricted primitive, because `mkdir` uses it to size the directory it has
+just created.
+
+**`unlink` on a directory.**  POSIX requires `EISDIR` (Linux) or `EPERM` (the
+BSDs); `rmdir` is the operation for it.  Allowing it left a directory with a
+link count of one that nothing could reach.  `unlink` now refuses it, and
+`rmdir` goes through an internal primitive for its own `.` and `..`.
+
+**`rmdir` and the parent's link count** (seed 10).  Not a missing decrement --
+removing `..` is what takes the link off the parent, correctly and once -- but a
+missing *ordering*: that decrement reached the disk before the entry removal did.
+`rmdir` now calls `block_inode_on_dir`, the same hold-back `mkdir` uses, on the
+block the entry came out of.
+
+**`rename` and link counts** (seed 14).  **Open, and the most serious of
+these.**  Renaming a directory moves it with neither parent's `nlink` moving:
+the root ends at 6 against a tree of 7, and inode 515 at 3 against 2.  A count
+too *low* is the direction that matters, because `fsck` trusts the tree and
+raises it -- the damage is bounded, but a root whose `nlink` understates its
+subdirectories looks removable to anything reasoning from the count alone.
+`rename` removes both entries with `unlink`, which drops a link from the *named
+inode* and never from a parent; a directory's link on its parent is only taken by
+removing the `..` that names it, which only `rmdir` does.  The fix is FreeBSD's
+three-part directory rename, not a `nlink -= 1`.
+
+What the test also showed is that a seed is only half a report: the sequence is
+the other half, and `run_seed` now prints what it did.
+
 ## 4. What is not implemented
 
 These are the remaining phases.  For each: what has to be created, the ordering

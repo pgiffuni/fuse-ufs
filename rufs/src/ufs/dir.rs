@@ -305,7 +305,13 @@ impl<R: Backend> Ufs<R> {
 		Ok(None)
 	}
 
-	pub(super) fn dir_unlink(&mut self, dinr: InodeNum, name: &OsStr) -> IoResult<InodeNum> {
+	/// Remove a directory entry.
+	///
+	/// Returns the inode it named and the cache block it was removed from.  The
+	/// block matters to `rmdir`: the parent's link count is not allowed to reach
+	/// the disk before the removal that justifies it does, and that is a
+	/// statement about one specific block.
+	pub(super) fn dir_unlink(&mut self, dinr: InodeNum, name: &OsStr) -> IoResult<(InodeNum, u64)> {
 		log::trace!("dir_unlink({dinr}, {name:?});");
 		self.assert_rw()?;
 		let dino = self.read_inode(dinr)?;
@@ -319,6 +325,7 @@ impl<R: Backend> Ufs<R> {
 
 			if let Some((inr, has, at)) = unlink_block(dinr, &mut block, name, self.file.config())?
 			{
+				let blk = self.dirent_block(dinr, pos)?.ok_or_else(|| err!(EIO))?;
 				if has {
 					// The entry's inode number is already zero in `block`.  Record
 					// where it was, so the inode's reclamation can wait for the
@@ -331,7 +338,7 @@ impl<R: Backend> Ufs<R> {
 					assert_eq!(n, dino.size - pos - DIRBLKSIZE as u64);
 					self.inode_truncate(dinr, dino.size - DIRBLKSIZE as u64)?;
 				}
-				return Ok(inr);
+				return Ok((inr, blk));
 			}
 
 			pos += DIRBLKSIZE as u64;
@@ -456,7 +463,32 @@ impl<R: Backend> Ufs<R> {
 	pub fn unlink(&mut self, dinr: InodeNum, name: &OsStr) -> IoResult<()> {
 		log::trace!("unlink({dinr}, {name:?});");
 		self.assert_rw()?;
-		let inr = self.dir_unlink(dinr, name)?;
+		let inr = self.dir_lookup(dinr, name)?;
+
+		if self.read_inode(inr)?.kind() == InodeType::Directory {
+			// POSIX: `unlink` on a directory is `EISDIR` on Linux and `EPERM` on
+			// the BSDs; `rmdir` is the operation for it.  Allowing it here did
+			// not corrupt anything on its own -- the directory keeps its `.` and
+			// `..` and merely ends up with a link count of one -- but it left the
+			// filesystem reporting a link count that no longer matched anything
+			// that could reach the directory, which the randomised test found as a
+			// directory with no `.` at all.
+			log::warn!("unlink({dinr}, {name:?}): {inr} is a directory; use rmdir");
+			return Err(err!(EISDIR));
+		}
+
+		self.unlink_entry(dinr, name).map(|_| ())
+	}
+
+	/// Remove a directory entry and drop a link from whatever it named, with no
+	/// restriction on what that is.
+	///
+	/// This is the primitive behind [`Self::unlink`], and it is also what
+	/// `rmdir` uses for a directory's own `.` and `..` -- entries that *name*
+	/// directories, which the public `unlink` correctly refuses.  Refusing them
+	/// there is what stopped `rmdir` working at all.
+	fn unlink_entry(&mut self, dinr: InodeNum, name: &OsStr) -> IoResult<()> {
+		let (inr, _blk) = self.dir_unlink(dinr, name)?;
 		self.inode_free(inr)?;
 		Ok(())
 	}
@@ -527,11 +559,26 @@ impl<R: Backend> Ufs<R> {
 			return Err(err!(ENOTEMPTY));
 		}
 
-		assert_eq!(inr, self.dir_unlink(dinr, name)?);
+		let (child, dir_blk) = self.dir_unlink(dinr, name)?;
 
-		self.unlink(inr, OsStr::new(".."))?;
-		self.unlink(inr, OsStr::new("."))?;
+		self.unlink_entry(inr, OsStr::new(".."))?;
+		self.unlink_entry(inr, OsStr::new("."))?;
 		self.inode_free(inr)?;
+
+		// The parent's link count comes off here -- but not directly.  It comes
+		// off when `..` is unlinked above, because `..` named the parent, and
+		// that is the only decrement a removed subdirectory should cause.
+		//
+		// What is missing is the *ordering*: that decrement used to reach the
+		// disk before the entry removal did, so a crash in between left the
+		// parent counting a subdirectory its tree no longer contains.  The
+		// randomised crash test found it -- seed 10 -- and the repair is the same
+		// one `mkdir` uses: hold the parent's inode until the directory block
+		// holding the removal is on the disk.  See `Ufs::block_inode_on_dir`.
+		let parent_blk = self.metadata_blk(self.superblock.ino_to_fsba(dinr));
+		self.block_inode_on_dir(dinr, parent_blk, dir_blk);
+
+		let _ = child;
 		Ok(())
 	}
 

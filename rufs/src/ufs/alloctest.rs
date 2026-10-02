@@ -2947,6 +2947,67 @@ mod inodereclaim_defer {
 /// being finished: a range gated on something no further sync will resolve is
 /// not going out however many times `sync()` is called.  These tests say which is
 /// which, so that neither claim is made by accident.
+/// `truncate` on a directory, which POSIX requires to fail.
+///
+/// Found by the randomised test: `mkdir` followed by `truncate` left a
+/// directory whose `.` named seven unrelated inodes, because truncating it to
+/// zero freed the blocks holding `.` and `..` -- which are how the directory is
+/// found at all.
+#[cfg(test)]
+mod truncate_dirs {
+	use super::*;
+	use crate::InodeNum;
+
+	#[test]
+	fn a_directory_cannot_be_unlinked() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-ud"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+
+		let e = ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ud")).unwrap_err();
+		assert_eq!(e.raw_os_error(), Some(libc::EISDIR));
+
+		// Still there, and still a directory.
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-ud")).unwrap(),
+			inr
+		);
+		assert_eq!(ug.read_inode(inr).unwrap().nlink, 2);
+		assert!(ug.check_consistency().unwrap().is_clean());
+
+		// And `rmdir`, which is the operation for it, still works.
+		ug.rmdir(InodeNum::ROOT, OsStr::new("zzz-ud")).unwrap();
+		ug.sync_metadata().unwrap();
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	#[test]
+	fn a_directory_cannot_be_truncated() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mkdir(InodeNum::ROOT, OsStr::new("zzz-td"), 0o755, 0, 0)
+			.unwrap()
+			.inr;
+		let before = ug.read_inode(inr).unwrap();
+
+		for size in [0u64, 512, 32768] {
+			let e = ug.truncate(inr, size).unwrap_err();
+			assert_eq!(e.raw_os_error(), Some(libc::EISDIR), "size {size}");
+		}
+
+		// The directory is untouched, and still has the entries that make it a
+		// directory.
+		let after = ug.read_inode(inr).unwrap();
+		assert_eq!(after.size, before.size);
+		assert_eq!(after.blocks, before.blocks);
+		assert!(ug.check_consistency().unwrap().is_clean());
+		ug.dir_lookup(inr, OsStr::new(".")).unwrap();
+		ug.dir_lookup(inr, OsStr::new("..")).unwrap();
+	}
+}
+
 #[cfg(test)]
 mod syncsem {
 	use super::*;
@@ -3104,6 +3165,59 @@ mod syncsem {
 ///    disk holds the whole story.  A filesystem that quietly accumulates
 ///    unpublished work would pass every crash test and be useless.
 ///
+///
+/// # Findings, in the order the seeds produced them
+///
+/// **Seed 12, step 1 -- `truncate` on a directory.**  `mkdir`, then `truncate`
+/// the new directory.  `inode_truncate` had no kind check, so truncating it to
+/// zero freed the blocks holding its `.` and `..` -- which are how the directory
+/// is found at all.  The checker then read a freed and reallocated block as a
+/// directory and found seven entries all named `.`, each naming a different
+/// inode.  Fixed: `Ufs::truncate()` enforces `EISDIR`, and `inode_truncate`
+/// stays the unrestricted primitive because `mkdir` uses it.
+///
+/// **Seed 10, step 4 -- `rmdir` and the parent's link count.**  Not a missing
+/// decrement: removing `..` is what takes the link off the parent, correctly and
+/// once.  A missing *ordering* -- the decrement reached the disk before the entry
+/// removal did.  Fixed with `block_inode_on_dir`, the hold-back `mkdir` uses.
+///
+/// **Seed 14, step 7 -- `rename` and link counts.  Open.**  The root ends at
+/// `nlink` 6 against a tree of 7, and inode 515 at 3 against 2.  The count too
+/// *low* is the dangerous direction: `fsck` trusts the tree and raises it, so
+/// the damage is bounded, but a root whose `nlink` understates its subdirectories
+/// looks removable to anything reasoning from the count alone.
+///
+/// Seed 10 first showed this as an incompleteness -- a count too *high*, which
+/// `fsck` pass 4 simply overwrites -- and it was recorded as a fidelity gap rather
+/// than a bug.  Seed 14 shows the other direction, and the checker classes it as
+/// a contradiction.
+///
+/// The cause is structural.  `rename` removes the destination entry and the
+/// source entry with `unlink`, and `unlink` drops a link from the *named inode*,
+/// never from a parent.  A directory's link on its parent is only taken by
+/// removing the `..` that names that parent, which `unlink` does not do and only
+/// `rmdir` does.  So renaming a directory moves it with neither parent's count
+/// moving, and renaming one *over* a directory leaves the replaced directory's
+/// parent still counting it.
+///
+/// The fix is not a `nlink -= 1` in `rename`.  It is the model FreeBSD uses: a
+/// directory rename is three operations -- remove the destination, insert the
+/// source, rewrite the destination's `..` -- and the counts follow from that.
+/// Doing it piecemeal here would produce exactly the kind of plausible-looking
+/// decrement this paragraph is a warning about.
+///
+/// Two lessons from this test, both paid for.  A seed is only half a report; the
+/// sequence is the other half, which is why `run_seed` prints what it did.  And a
+/// property test that cannot be satisfied without weakening its assertion is
+/// telling you something -- the first version of this note blamed `newdir`, and
+/// replaying the prefix by hand disproved it.
+///
+/// To reproduce the open finding:
+///
+/// ```text
+/// cargo test -p rufs --ignore-rust-version random_sequences -- --ignored
+/// ```
+///
 /// Not a memory-safety test: nothing here is unchecked or unsafe.
 #[cfg(test)]
 mod random {
@@ -3142,7 +3256,7 @@ mod random {
 	const STEPS: usize = 14;
 
 	/// Run one seed.  Returns the step a crash was injected at, if any.
-	fn run_seed(seed: u64, image: &str) -> IoResult<Option<usize>> {
+	fn run_seed(seed: u64, image: &str, trace: bool) -> IoResult<Option<usize>> {
 		let (img, mut ug) = testutil::open_rw(image);
 		let mut rng = Rng(seed | 1);
 		let mut live: Vec<Made> = Vec::new();
@@ -3156,6 +3270,17 @@ mod random {
 			} else {
 				Some(rng.below(live.len() as u64) as usize)
 			};
+
+			let say = |what: String| {
+				if trace {
+					eprintln!("SEED {seed} step {step}: {what}");
+				}
+			};
+			say(format!(
+				"op={op} victim={:?} live={:?}",
+				victim.map(|i| (live[i].inr.get(), live[i].name.clone(), live[i].dir)),
+				live.iter().map(|m| m.name.clone()).collect::<Vec<_>>()
+			));
 
 			let ok = match (op, victim) {
 				// create
@@ -3210,8 +3335,10 @@ mod random {
 						Err(_) => false,
 					}
 				}
-				// unlink
-				(2, Some(i)) => {
+				// unlink, files only: `unlink` on a directory is `EISDIR` and
+				// `rmdir` is the operation for it, so a property test must not
+				// explore it -- the filesystem refusing it is the invariant.
+				(2, Some(i)) if !live[i].dir => {
 					let v = &live[i];
 					ug.unlink(InodeNum::ROOT, OsStr::new(&v.name)).is_ok()
 				}
@@ -3220,8 +3347,8 @@ mod random {
 					let v = &live[i];
 					ug.rmdir(InodeNum::ROOT, OsStr::new(&v.name)).is_ok()
 				}
-				// truncate to a random size
-				(4, Some(i)) => {
+				// truncate to a random size, files only
+				(4, Some(i)) if !live[i].dir => {
 					let v = &live[i];
 					let size = rng.below(6) * 32768;
 					ug.inode_truncate(v.inr, size).is_ok()
@@ -3281,6 +3408,7 @@ mod random {
 				// Crash after a random number of passes: somewhere between
 				// "nothing has gone out" and "everything has".
 				let passes = 1 + rng.below(4) as usize;
+				say(format!("crash after {passes} pass(es)"));
 				for _ in 0..passes {
 					if ug.sync_metadata_one_pass().unwrap() == 0 {
 						break;
@@ -3303,9 +3431,11 @@ mod random {
 				st.is_drained(),
 				"seed {seed} step {step}: a complete sync left work behind: {st:?}"
 			);
-			// Coherence is the hard invariant: the disk may be mid-operation but
-			// must never contradict itself.  It is *not* `is_clean` -- see
-			// `a_synced_filesystem_is_clean` for the gap that shows here.
+			// Coherence is the invariant that must hold at *every* crash point, and
+			// the one this test is here to defend.  The stronger
+			// `is_clean` -- that a complete sync leaves nothing outstanding -- is
+			// asserted in `syncsem`, and it is currently false for a directory
+			// moved by `rename`; see this module's note.
 			let report = ug.check_consistency().unwrap();
 			assert!(
 				report.is_coherent(),
@@ -3344,10 +3474,34 @@ mod random {
 	/// ```text
 	/// cargo test -p rufs --ignore-rust-version random_sequences -- --ignored
 	/// ```
+	/// A second finding, fixed: seed 10 step 4 left the parent's `nlink` ahead of
+	/// its tree after a complete drain.
+	///
+	/// `rmdir` removes the entry and then removes `..`, and it is that `..`
+	/// removal which takes the link off the parent -- correctly, and exactly
+	/// once.  What was missing was the *ordering*: the decrement reached the disk
+	/// before the removal did.  The repair is the one `mkdir` uses,
+	/// `block_inode_on_dir`, which `rmdir` now calls on the block the entry came
+	/// out of.  (`dir_unlink` now reports that block, which it is the only place
+	/// that knows.)
+	///
+	/// It is still reproduced by seed 10, through a *rename*: `rename` of a
+	/// directory calls `unlink` on the source entry, and `unlink` -- unlike
+	/// `rmdir` -- never removes the `..` that would take the link off the source
+	/// parent.  So a directory moved out of a directory leaves that parent
+	/// counting it.  Repairable, so it is an incompleteness rather than a
+	/// contradiction, and it is the same shape as the `rmdir` one.
+	///
+	/// Not fixed here: `rename` between directories needs its own treatment
+	/// (the destination's `..` has to be rewritten too), and doing that
+	/// correctly is a larger piece than the gap deserves to be closed by
+	/// accident.
 	#[test]
-	#[ignore = "finds a contradiction: seed 12 step 1 leaves seven '.' entries in \
-	            inode 514 naming seven different inodes.  A directory block is \
-	            being written at a stale offset.  Not diagnosed; see the note"]
+	#[ignore = "finds a contradiction: rename does not maintain link counts when \
+	            the entry renamed is a directory.  Seed 14 leaves the root at \
+	            nlink 6 against a tree of 7, and inode 515 at 3 against 2.  The \
+	            count that is too *low* is the dangerous direction.  Not \
+	            diagnosed; see the note"]
 	fn random_sequences_stay_coherent() {
 		let mut crashed = 0;
 		let mut completed = 0;
@@ -3359,7 +3513,10 @@ mod random {
 			} else {
 				"ufs-big"
 			};
-			if run_seed(seed, image).unwrap().is_some() {
+			// Trace: the seed is only half a report; the sequence is the other
+			// half, and a reader should not have to re-run and instrument to get
+			// it.
+			if run_seed(seed, image, true).unwrap().is_some() {
 				crashed += 1;
 			} else {
 				completed += 1;
