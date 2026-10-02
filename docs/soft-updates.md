@@ -497,6 +497,14 @@ checker.
   rename are not modelled separately. Today they cannot produce a contradiction,
   because the only reachable state is the entry existing under the old name,
   which is exactly what a crash before the rename would leave.
+* *Link counts and their entries are not published atomically.*  A directory's
+  `i_nlink` cannot go out in the same write as the entry that justifies it, so
+  between the two there is a state where the count and the tree disagree.  Both
+  parents of a cross-directory rename are held back until *both* entries have
+  moved, which narrows the window to a single write, but does not close it: any
+  implementation that does not make the rename atomic has such a window, which
+  is what FreeBSD's `fsck` pass 4 exists for.  `check_consistency()` classifies
+  it as an *incompleteness* for that reason, in both directions.
 * *Meta-devices and snapshotting.*  Nothing here has been thought about for
   `UFS2RG`/`UFS2SB`; the metadata cache would need the same treatment and
   currently has none.

@@ -253,6 +253,24 @@ fn unlink_block(
 	Ok(None)
 }
 
+/// The offset of the `..` entry in a directory block, if it is in this block.
+///
+/// `..` is written second by [`newdir`], so it is at a fixed offset in the
+/// first block, but scanning for it rather than assuming is what keeps this
+/// honest if the record layout ever changes.
+fn dotdot_entry(block: &[u8], config: Config) -> IoResult<Option<u64>> {
+	let mut file = Decoder::new(Cursor::new(block), config);
+	loop {
+		let pos = file.pos()?;
+		let Ok(Some(hdr)) = Header::parse(&mut file) else {
+			return Ok(None);
+		};
+		if hdr.name[..hdr.namelen as usize] == *b".." {
+			return Ok(Some(pos));
+		}
+	}
+}
+
 fn newdir(dinr: InodeNum, inr: InodeNum, config: Config) -> IoResult<[u8; DIRBLKSIZE]> {
 	let mut block = [0u8; DIRBLKSIZE];
 	let mut file = Decoder::new(Cursor::new(&mut block as &mut [u8]), config);
@@ -347,13 +365,18 @@ impl<R: Backend> Ufs<R> {
 		Err(err!(ENOENT))
 	}
 
+	/// Add a directory entry, and report the cache block it went into.
+	///
+	/// The block matters to `rename_dir`, which has to hold a parent's link count
+	/// back until the entry that justifies it is on the disk -- and that is a
+	/// statement about one specific block.
 	pub(super) fn dir_newlink(
 		&mut self,
 		dinr: InodeNum,
 		inr: InodeNum,
 		name: &OsStr,
 		kind: InodeType,
-	) -> IoResult<()> {
+	) -> IoResult<u64> {
 		log::trace!("dir_newlink({dinr}, {inr}, {name:?}, {kind:?});");
 		self.assert_rw()?;
 		let dino = self.read_inode(dinr)?;
@@ -370,7 +393,9 @@ impl<R: Backend> Ufs<R> {
 			if let Some(at) = newlink_block(&mut block, entry, self.file.config())? {
 				self.inode_write(dinr, pos, &block)?;
 				self.gate_dirent(dinr, pos, at, inr)?;
-				return Ok(());
+				return self
+					.dirent_block(dinr, pos)
+					.and_then(|b| b.ok_or_else(|| err!(EIO)));
 			}
 
 			pos += DIRBLKSIZE as u64;
@@ -386,7 +411,8 @@ impl<R: Backend> Ufs<R> {
 		self.inode_write(dinr, pos, &block)?;
 		// A fresh block starts with the entry at offset zero.
 		self.gate_dirent(dinr, pos, 0, inr)?;
-		Ok(())
+		self.dirent_block(dinr, pos)
+			.and_then(|b| b.ok_or_else(|| err!(EIO)))
 	}
 
 	/// Hold back the inode number of a directory entry until `inr` is on the
@@ -522,25 +548,216 @@ impl<R: Backend> Ufs<R> {
 				Err(e) => return Err(e),
 			}
 		} else {
-			// Not sure whether the kernel ensures for us that the file no longer exists,
-			// if this triggers we know we guessed wrong.
-			match self.unlink(d_dinr, d_name) {
-				    Ok(_) => log::warn!("rename({d_dinr}, {d_name:?} {s_dinr}, {s_name:?}, {replace}): Destination already exists, unlinked"),
-					// TODO: Need raw OS error here?
-					Err(e) if e.kind() == ErrorKind::NotFound => { },
-					// TODO: Handle not a directory etc.
-					Err(e) => return Err(e),
+			match self.dir_lookup(d_dinr, d_name) {
+				// A destination directory has to go through `rmdir`, which checks
+				// that it is empty and -- unlike `unlink` -- takes the link off its
+				// parent.  Calling `unlink` on one destroyed it: `unlink` never
+				// removes the `..` that is the link.
+				Ok(old) if self.inode_attr(old)?.kind == InodeType::Directory => {
+					self.rmdir(d_dinr, d_name)?;
 				}
+				Ok(_) => self.unlink(d_dinr, d_name)?,
+				Err(e) if e.kind() == ErrorKind::NotFound => {}
+				Err(e) => return Err(e),
+			}
 		}
 
 		let kind = self.inode_attr(inr)?.kind;
-		// unlink decrements the refcount, if it reaches 0 the file may get removed.
+		if kind == InodeType::Directory {
+			return self.rename_dir(d_dinr, d_name, s_dinr, s_name, inr);
+		}
+
+		// `unlink` decrements the refcount, if it reaches 0 the file may get removed.
 		// Bump the counter before to workaround.
 		self.inode_bump(inr)?;
 		self.dir_newlink(d_dinr, inr, d_name, kind)?;
 
 		self.unlink(s_dinr, s_name)?;
 		Ok(inr)
+	}
+
+	/// Move a directory from `(s_dinr, s_name)` to `(d_dinr, d_name)`.
+	///
+	/// A directory rename is three operations, not two, and the link counts are a
+	/// consequence of doing all three rather than something to adjust
+	/// separately:
+	///
+	/// 1. remove the entry from the source parent;
+	/// 2. add it to the destination parent;
+	/// 3. rewrite the moved directory's `..`.
+	///
+	/// Doing only the first two is what this used to do, and it leaves two
+	/// things wrong.  Neither parent's `i_nlink` moves -- a link count is a
+	/// count of entries, and moving one does not change either count -- so the
+	/// source parent keeps counting a directory its tree no longer contains.
+	/// And the moved directory's `..` still names the *old* parent, so anything
+	/// that walks up from it arrives somewhere that has never heard of it.  The
+	/// randomised crash test found the link count; it is the same defect.
+	///
+	/// The destination parent's count is also untouched, which is right: a move
+	/// does not add a subdirectory, it relocates one.  It only changes when the
+	/// rename *replaces* a directory, and that removal is `rmdir`'s job, above.
+	fn rename_dir(
+		&mut self,
+		d_dinr: InodeNum,
+		d_name: &OsStr,
+		s_dinr: InodeNum,
+		s_name: &OsStr,
+		inr: InodeNum,
+	) -> IoResult<InodeNum> {
+		log::trace!("rename_dir({d_dinr}, {d_name:?} <- {s_dinr}, {s_name:?} = {inr});");
+
+		// Moving a directory inside itself would make `..` a cycle, and `..` is
+		// the only way anything finds a directory's parent.
+		if self.is_descendant(inr, d_dinr)? {
+			log::error!("rename_dir: {inr} contains {d_dinr}");
+			return Err(err!(EINVAL));
+		}
+
+		// 1 and 2: move the entry.  `dir_unlink` rather than `unlink`, because
+		// the directory must survive: `unlink` would take it to zero links and
+		// free a directory that is being moved rather than removed.
+		let (moved, s_dir_blk) = self.dir_unlink(s_dinr, s_name)?;
+		debug_assert_eq!(moved, inr);
+		let d_dir_blk = self.dir_newlink(d_dinr, inr, d_name, InodeType::Directory)?;
+
+		// 3: the moved directory's `..` has to name its new parent, or every
+		// walk up from it lands in a directory that does not contain it.
+		if s_dinr != d_dinr {
+			self.rewrite_dotdot(inr, d_dinr)?;
+
+			// A directory's depth is *cached* in the inode, set from the parent's
+			// at allocation.  Moving one leaves every descendant's cached value
+			// stale, and `check_consistency()` compares a child's cached depth
+			// against its parent's, so a stale value reads as a contradiction.
+			//
+			// The whole subtree moves, not just the directory: `..` is the only way
+			// anything finds a directory's parent, and depth is the same kind of
+			// derived-but-stored value.
+			let was = self.read_inode(s_dinr)?.dir_depth().unwrap_or(0);
+			let now = self.read_inode(d_dinr)?.dir_depth().unwrap_or(0);
+			if now != was {
+				self.shift_dir_depth(inr, now as i64 - was as i64, 0)?;
+			}
+		}
+
+		// 4: the parents' counts.  A directory's `i_nlink` is 2 plus its
+		// subdirectories, so from the source parent's side the move removes a
+		// subdirectory and from the destination parent's side it adds one.
+		//
+		// I wrote in the comment above that a move "changes neither count", and
+		// that was wrong in the way that matters: it is right of the *moved*
+		// directory and wrong of both parents.  The randomised test found it --
+		// seed 14 -- and the count that came out too low is the dangerous
+		// direction, because a root whose `i_nlink` understates its
+		// subdirectories looks removable to anything reasoning from the count.
+		//
+		// These are counters, so they cannot be byte-range gated: zeroing one
+		// would be a wrong number rather than a stale one.  What holds them back
+		// is the whole-buffer mechanism `MkdirParentDep` uses.  The device then
+		// keeps the previous inode image, whose count was consistent with the
+		// previous entry layout -- and that layout is self-consistent on its own.
+		//
+		// Both parents are held against *both* blocks, because either half of the
+		// move -- the source entry gone and the destination entry not yet there,
+		// or the reverse -- is a state in which one of the two counts is wrong.
+		if s_dinr != d_dinr {
+			let mut sdino = self.read_inode(s_dinr)?;
+			sdino.nlink -= 1;
+			self.write_inode(s_dinr, &sdino)?;
+
+			let mut ddino = self.read_inode(d_dinr)?;
+			ddino.nlink += 1;
+			self.write_inode(d_dinr, &ddino)?;
+
+			for parent in [s_dinr, d_dinr] {
+				let pblk = self.metadata_blk(self.superblock.ino_to_fsba(parent));
+				for dblk in [s_dir_blk, d_dir_blk] {
+					self.block_inode_on_dir(parent, pblk, dblk);
+				}
+			}
+		}
+
+		Ok(inr)
+	}
+
+	/// Shift the cached depth of `inr`'s subtree by `delta`.
+	///
+	/// `hops` bounds the recursion.  `rename_dir` refuses to move a directory
+	/// inside itself first, so a cycle cannot be created here -- but the image
+	/// could already be cyclic, and an unbounded walk over one turns an error
+	/// into a hang.
+	fn shift_dir_depth(&mut self, inr: InodeNum, delta: i64, hops: u32) -> IoResult<()> {
+		if hops > 4096 {
+			log::error!("shift_dir_depth({inr}): no root after 4096 levels");
+			return Err(err!(EIO));
+		}
+		let mut ino = self.read_inode(inr)?;
+		if ino.kind() != InodeType::Directory {
+			return Ok(());
+		}
+		let depth = ino.dir_depth().unwrap_or(0);
+		let shifted = depth as i64 + delta;
+		if shifted < 0 {
+			log::error!("shift_dir_depth({inr}): depth {depth} + {delta} underflows");
+			return Err(err!(EIO));
+		}
+		ino.set_dir_depth(shifted as u32);
+		self.write_inode(inr, &ino)?;
+		log::trace!("shift_dir_depth({inr}): {depth} -> {shifted}");
+
+		let mut kids = Vec::new();
+		self.dir_iter(inr, |name, inr2, kind| {
+			if kind == InodeType::Directory && name != OsStr::new(".") && name != OsStr::new("..") {
+				kids.push(inr2);
+			}
+			None::<u8>
+		})?;
+		for k in kids {
+			self.shift_dir_depth(k, delta, hops + 1)?;
+		}
+		Ok(())
+	}
+
+	/// Whether `ancestor` is `start` or one of its ancestors.
+	///
+	/// Walks `..` and stops after a bounded number of steps, because a
+	/// filesystem that is already cyclic must not hang here: this runs on the
+	/// error path of nothing, and an unbounded walk over a corrupt image would
+	/// turn a rejected rename into a hang.
+	fn is_descendant(&mut self, ancestor: InodeNum, start: InodeNum) -> IoResult<bool> {
+		let mut cur = start;
+		for _ in 0..1024 {
+			if cur == ancestor {
+				return Ok(true);
+			}
+			match self.dir_lookup(cur, OsStr::new("..")) {
+				Ok(next) if next != cur => cur = next,
+				_ => return Ok(false),
+			}
+		}
+		log::error!("is_descendant({ancestor}, {start}): no root after 1024 levels");
+		Ok(false)
+	}
+
+	/// Point `inr`'s `..` at `parent`.
+	fn rewrite_dotdot(&mut self, inr: InodeNum, parent: InodeNum) -> IoResult<()> {
+		let dino = self.read_inode(inr)?;
+		let mut block = vec![0u8; DIRBLKSIZE];
+		let mut pos = 0;
+		while pos < dino.size {
+			let n = self.inode_read(inr, pos, &mut block)?;
+			assert_eq!(n, DIRBLKSIZE);
+			if let Some(at) = dotdot_entry(&block, self.file.config())? {
+				let at = at as usize;
+				block[at..at + 4].copy_from_slice(&parent.get().to_le_bytes());
+				self.inode_write(inr, pos, &block)?;
+				log::trace!("rewrite_dotdot({inr}): .. is now {parent}");
+				return Ok(());
+			}
+			pos += DIRBLKSIZE as u64;
+		}
+		Err(err!(ENOENT))
 	}
 
 	pub fn rmdir(&mut self, dinr: InodeNum, name: &OsStr) -> IoResult<()> {

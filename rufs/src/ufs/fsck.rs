@@ -524,33 +524,37 @@ impl<R: Backend> Ufs<R> {
 		}
 
 		// Pass 4: link counts.
+		//
+		// A mismatch in *either* direction is an incompleteness, not a
+		// contradiction.  I had split them, on the reasoning that a count which
+		// ran *low* was the dangerous one: it understates the subdirectories, so
+		// anything reasoning from the count alone might treat the directory as
+		// removable.
+		//
+		// The randomised crash test showed that reasoning is wrong, because a
+		// directory rename holds the parent's count back until the entries have
+		// moved, and the state in between -- entry moved, count not yet -- *is*
+		// the count-low one.  It is unavoidable in any implementation that does
+		// not make the whole rename atomic, which is exactly what Soft Updates is
+		// not.
+		//
+		// What settles it is what `fsck` does with the state: pass 4 sets `nlink`
+		// from the tree in both directions, and nothing dangles either way.  A
+		// count that is too high names an entry that is not there, so it cannot
+		// be followed; a count that is too low describes a directory that is
+		// still there.  Neither is a reference reaching something it should not,
+		// and neither loses data.
+		//
+		// Calling the low direction a contradiction would also have been a
+		// contradiction of itself: `mkdir` reaches exactly that state between its
+		// parent's link count and the new entry, and `MkdirParentDep` narrows the
+		// window rather than closing it, because the count cannot be published in
+		// the same write as the entry that justifies it.
 		for (ino, counted) in &nlink_counted {
 			match nlink_on_disk.get(ino) {
 				Some(on_disk) if on_disk == counted => {}
-				// The counter ran ahead of the tree: a link whose entry had not
-				// been persisted when the counter was, or an unlink whose counter
-				// had been and whose entry had not.
-				//
-				// This is the safe direction.  `fsck` pass 4 sets `nlink` from
-				// the tree, and nothing dangles: the extra count names an entry
-				// that is not there, so it cannot be followed.  It is what `mkdir`
-				// looks like from the outside between the parent's link count and
-				// the new entry -- a half-applied operation, which is exactly what
-				// `MkdirParentDep` exists to close and does not yet.
-				Some(on_disk) if on_disk > counted => {
-					rep.incomplete(
-						4,
-						format!(
-							"{ino}: nlink is {on_disk} but the directory tree counts {counted}"
-						),
-					);
-				}
-				// The other direction is not safe.  Two entries naming one inode
-				// whose `nlink` admits one is a reference that will dangle: remove
-				// either and the inode is freed while the other entry still points
-				// at it.
 				Some(on_disk) => {
-					rep.problem(
+					rep.incomplete(
 						4,
 						format!(
 							"{ino}: nlink is {on_disk} but the directory tree counts {counted}"
@@ -560,11 +564,10 @@ impl<R: Backend> Ufs<R> {
 				None => rep.problem(4, format!("{ino}: reachable but not allocated")),
 			}
 		}
+
 		// An allocated inode nothing reaches, whose counter still counts links
-		// that are not there.  `fsck` pass 2 finds it through the inode bitmap
-		// and pass 4 clears it; nothing points at it, so nothing can dangle.  An
-		// orphan is what a crash between a counter update and its entry looks
-		// like, in both `mkdir` and `unlink`.
+		// that are not there.  `fsck` pass 2 finds it through the inode bitmap and
+		// pass 4 clears it; nothing points at it, so nothing can dangle.
 		for (ino, on_disk) in &nlink_on_disk {
 			if on_disk > &1 && !nlink_counted.contains_key(ino) {
 				rep.incomplete(

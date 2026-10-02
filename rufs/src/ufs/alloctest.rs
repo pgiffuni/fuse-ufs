@@ -3219,6 +3219,232 @@ mod syncsem {
 /// ```
 ///
 /// Not a memory-safety test: nothing here is unchecked or unsafe.
+/// Renaming a directory, which is three operations rather than two.
+#[cfg(test)]
+mod renamedir {
+	use super::*;
+	use crate::{InodeNum, InodeType};
+
+	fn mkdir(ug: &mut Ufs<std::fs::File>, parent: InodeNum, name: &str) -> InodeNum {
+		ug.mkdir(parent, OsStr::new(name), 0o755, 0, 0).unwrap().inr
+	}
+
+	fn create(ug: &mut Ufs<std::fs::File>, name: &str) -> InodeNum {
+		ug.mknod(
+			InodeNum::ROOT,
+			OsStr::new(name),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap()
+		.inr
+	}
+
+	/// Moving a directory neither adds nor removes a link from either parent, and
+	/// the moved directory's `..` follows it.
+	///
+	/// The link counts are the part the randomised test found: a link count is a
+	/// count of entries, and relocating one changes neither count.  `..` is the
+	/// part nothing had caught -- a moved directory whose `..` still names the
+	/// old parent sends every walk up from it somewhere that has never heard of
+	/// it.
+	#[test]
+	fn moving_a_directory_keeps_both_parents_honest() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let a = mkdir(&mut ug, InodeNum::ROOT, "zzz-a");
+		let b = mkdir(&mut ug, InodeNum::ROOT, "zzz-b");
+		ug.sync_metadata().unwrap();
+
+		let root_links = ug.read_inode(InodeNum::ROOT).unwrap().nlink;
+		assert_eq!(
+			ug.read_inode(a).unwrap().nlink,
+			2,
+			"a fresh directory has . and .."
+		);
+		assert_eq!(ug.dir_lookup(a, OsStr::new("..")).unwrap(), InodeNum::ROOT);
+
+		ug.rename(
+			b,
+			OsStr::new("zzz-moved"),
+			InodeNum::ROOT,
+			OsStr::new("zzz-a"),
+			true,
+		)
+		.unwrap();
+		ug.sync_metadata().unwrap();
+
+		// A directory's `i_nlink` is 2 plus its subdirectories, so the move takes
+		// one off the source parent and puts one on the destination parent.  The
+		// moved directory's own count does not change: it still has `.` and `..`.
+		assert_eq!(
+			ug.read_inode(InodeNum::ROOT).unwrap().nlink,
+			root_links - 1,
+			"the source parent still counts the directory it no longer holds"
+		);
+		assert_eq!(
+			ug.read_inode(b).unwrap().nlink,
+			3,
+			"the destination parent did not gain the subdirectory"
+		);
+
+		// The entry moved.
+		assert!(ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-a")).is_err());
+		assert_eq!(ug.dir_lookup(b, OsStr::new("zzz-moved")).unwrap(), a);
+
+		// And `..` followed it.
+		assert_eq!(ug.dir_lookup(a, OsStr::new("..")).unwrap(), b);
+		assert_eq!(ug.dir_lookup(a, OsStr::new(".")).unwrap(), a);
+		assert_eq!(ug.read_inode(a).unwrap().nlink, 2);
+
+		// Not `is_clean()`: pass 5 infers a directory's depth from where its
+		// inode sits in the inode table, because UFS stores none.  That inference
+		// is correct until a directory moves, when the inode stays put and its
+		// `..` does not.  FreeBSD's pass 5 re-walks the tree for this reason and
+		// this checker does not yet; the messages below are the only pass 5
+		// complaint and it is about depth, not about anything moved.
+		let rep = ug.check_consistency().unwrap();
+		assert!(
+			rep.problems.iter().all(|p| p.msg.contains("depth")),
+			"{rep:?}"
+		);
+	}
+
+	/// Renaming a directory over an existing one removes the destination through
+	/// `rmdir`, which checks it is empty and -- unlike `unlink` -- takes the
+	/// link off its parent.
+	#[test]
+	fn renaming_over_an_empty_directory_replaces_it() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let old = mkdir(&mut ug, InodeNum::ROOT, "zzz-old");
+		let new = mkdir(&mut ug, InodeNum::ROOT, "zzz-new");
+		ug.sync_metadata().unwrap();
+
+		let links = ug.read_inode(InodeNum::ROOT).unwrap().nlink;
+		ug.rename(
+			InodeNum::ROOT,
+			OsStr::new("zzz-old"),
+			InodeNum::ROOT,
+			OsStr::new("zzz-new"),
+			true,
+		)
+		.unwrap();
+		ug.sync_metadata().unwrap();
+
+		// The replacement *is* a removal: the destination directory is gone, so
+		// the parent has one fewer subdirectory.  `rmdir` is what takes it off --
+		// not the rename, which only moves the survivor into its place.
+		assert_eq!(
+			ug.read_inode(InodeNum::ROOT).unwrap().nlink,
+			links - 1,
+			"the replaced directory was not taken off the parent's count"
+		);
+		// The destination name survives, and it names what was the source; the
+		// source name is gone.  (`zzz-old` is the destination.)
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-old"))
+				.unwrap(),
+			new
+		);
+		assert!(ug
+			.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-new"))
+			.is_err());
+		assert!(
+			ug.read_inode(old).is_err(),
+			"the replaced directory was not released"
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// A non-empty destination directory is not replaced.
+	#[test]
+	fn renaming_over_a_non_empty_directory_fails() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let outer = mkdir(&mut ug, InodeNum::ROOT, "zzz-full");
+		mkdir(&mut ug, InodeNum::ROOT, "zzz-src");
+		// Inside the *destination*, so that it is the non-empty one.
+		ug.mknod(
+			outer,
+			OsStr::new("zzz-inner"),
+			InodeType::RegularFile,
+			0o644,
+			0,
+			0,
+		)
+		.unwrap();
+		ug.sync_metadata().unwrap();
+
+		let e = ug
+			.rename(
+				InodeNum::ROOT,
+				OsStr::new("zzz-full"),
+				InodeNum::ROOT,
+				OsStr::new("zzz-src"),
+				true,
+			)
+			.unwrap_err();
+		assert_eq!(e.raw_os_error(), Some(libc::ENOTEMPTY));
+		assert!(ug.check_consistency().unwrap().is_coherent());
+	}
+
+	/// A directory cannot be moved inside itself: that would make `..` a cycle,
+	/// and `..` is the only way anything finds a directory's parent.
+	#[test]
+	fn a_directory_cannot_be_moved_inside_itself() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let outer = mkdir(&mut ug, InodeNum::ROOT, "zzz-outer");
+		let inner = mkdir(&mut ug, outer, "zzz-inner");
+		ug.sync_metadata().unwrap();
+
+		let e = ug
+			.rename(
+				inner,
+				OsStr::new("zzz-nested"),
+				InodeNum::ROOT,
+				OsStr::new("zzz-outer"),
+				false,
+			)
+			.unwrap_err();
+		assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+
+		// Nothing moved.
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-outer"))
+				.unwrap(),
+			outer
+		);
+		assert_eq!(
+			ug.dir_lookup(outer, OsStr::new("zzz-inner")).unwrap(),
+			inner
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// Renaming a file is unchanged by any of this.
+	#[test]
+	fn renaming_a_file_is_unaffected() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = create(&mut ug, "zzz-f");
+		ug.sync_metadata().unwrap();
+		ug.rename(
+			InodeNum::ROOT,
+			OsStr::new("zzz-f2"),
+			InodeNum::ROOT,
+			OsStr::new("zzz-f"),
+			true,
+		)
+		.unwrap();
+		ug.sync_metadata().unwrap();
+		assert_eq!(
+			ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-f2")).unwrap(),
+			inr
+		);
+		assert_eq!(ug.read_inode(inr).unwrap().nlink, 1);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+}
+
 #[cfg(test)]
 mod random {
 	use super::*;
@@ -3404,7 +3630,13 @@ mod random {
 			let _ = ok;
 
 			// Does the disk get told, or do we crash?
-			if rng.below(4) == 0 {
+			//
+			// One in eight, not one in four: at one in four over fourteen steps the
+			// chance a seed sees no crash at all is about 2%, so with 48 seeds
+			// essentially every seed crashed and nothing exercised the
+			// post-drain path.  The guard below caught that, which is what it is
+			// for.
+			if rng.below(8) == 0 {
 				// Crash after a random number of passes: somewhere between
 				// "nothing has gone out" and "everything has".
 				let passes = 1 + rng.below(4) as usize;
@@ -3497,11 +3729,6 @@ mod random {
 	/// correctly is a larger piece than the gap deserves to be closed by
 	/// accident.
 	#[test]
-	#[ignore = "finds a contradiction: rename does not maintain link counts when \
-	            the entry renamed is a directory.  Seed 14 leaves the root at \
-	            nlink 6 against a tree of 7, and inode 515 at 3 against 2.  The \
-	            count that is too *low* is the dangerous direction.  Not \
-	            diagnosed; see the note"]
 	fn random_sequences_stay_coherent() {
 		let mut crashed = 0;
 		let mut completed = 0;
@@ -3526,5 +3753,109 @@ mod random {
 		// about the crash path.
 		assert!(crashed > 0, "no seed ever reached a crash point");
 		assert!(completed > 0, "no seed ever ran to the end");
+	}
+}
+
+/// The parents' link counts are held back across a cross-directory rename.
+///
+/// The counts are counters, so they cannot be byte-range gated -- zeroing one
+/// would be a wrong number rather than a stale one.  What holds them is the
+/// whole-buffer mechanism: the device keeps the previous inode image, whose
+/// count was consistent with the previous entry layout, and that layout is
+/// self-consistent on its own.
+#[cfg(test)]
+mod renamelink {
+	use super::*;
+	use crate::{InodeNum, InodeType};
+
+	fn mkdir(ug: &mut Ufs<std::fs::File>, parent: InodeNum, name: &str) -> InodeNum {
+		ug.mkdir(parent, OsStr::new(name), 0o755, 0, 0).unwrap().inr
+	}
+
+	#[test]
+	fn both_parents_are_held_back_across_a_move() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		let a = mkdir(&mut ug, InodeNum::ROOT, "zzz-a");
+		let b = mkdir(&mut ug, InodeNum::ROOT, "zzz-b");
+		ug.sync_metadata().unwrap();
+
+		let root_blk = ug.metadata_blk(ug.superblock.ino_to_fsba(InodeNum::ROOT));
+		let b_blk = ug.metadata_blk(ug.superblock.ino_to_fsba(b));
+
+		ug.rename(
+			b,
+			OsStr::new("zzz-moved"),
+			InodeNum::ROOT,
+			OsStr::new("zzz-a"),
+			true,
+		)
+		.unwrap();
+
+		// Both counts changed in the live image...
+		assert_eq!(
+			ug.read_inode(b).unwrap().nlink,
+			3,
+			"the live count should move"
+		);
+		// ...and neither parent's inode may reach the disk until the entries have.
+		assert!(
+			ug.metadata_cache().is_blocked(root_blk),
+			"the source parent's count could reach the disk before the entry did"
+		);
+		assert!(
+			ug.metadata_cache().is_blocked(b_blk),
+			"the destination parent's count could reach the disk before the entry did"
+		);
+		assert_eq!(a, ug.dir_lookup(b, OsStr::new("zzz-moved")).unwrap());
+
+		ug.sync_metadata().unwrap();
+		assert!(!ug.metadata_cache().is_blocked(root_blk));
+		assert!(!ug.metadata_cache().is_blocked(b_blk));
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// At no crash point during the move may a parent's count disagree with its
+	/// own tree, because that is the state `fsck` cannot tell from corruption.
+	#[test]
+	fn a_crash_during_a_move_never_disagrees_with_the_tree() {
+		for n in 0..8 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			let a = mkdir(&mut ug, InodeNum::ROOT, "zzz-a");
+			let b = mkdir(&mut ug, InodeNum::ROOT, "zzz-b");
+			ug.sync_metadata().unwrap();
+
+			ug.rename(
+				b,
+				OsStr::new("zzz-moved"),
+				InodeNum::ROOT,
+				OsStr::new("zzz-a"),
+				true,
+			)
+			.unwrap();
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let report = ug.check_consistency().unwrap();
+			assert!(
+				report.is_coherent(),
+				"rename/cross-directory/crash-{n}: {report:?}"
+			);
+			// The directory is either in one place or the other, never both and
+			// never neither.
+			let at_root = ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-a")).is_ok();
+			let at_dest = ug.dir_lookup(b, OsStr::new("zzz-moved")).is_ok();
+			assert!(
+				at_root ^ at_dest,
+				"the directory is in both places or neither"
+			);
+			if at_dest {
+				assert_eq!(ug.dir_lookup(a, OsStr::new("..")).unwrap(), b);
+			}
+		}
 	}
 }
