@@ -211,6 +211,30 @@ directory entry's inode number, which is exactly the case zeroing is right for.
 | extended attributes | stored outside the block map |
 | directory *removal* | `dir_unlink()` writes the shrunken directory immediately; `Gate::InodeLinkCounted` has no operation raising it |
 
+### Link counts are not byte-ranges either
+
+`i_nlink` is a counter, so `InodeLinkCounted` and `MkdirParentDep` hit the same
+wall as `FreeBlocksDep`: a gate holds a range back by zeroing it, and a zeroed
+`nlink` is wrong rather than stale.
+
+The crash window is real and open.  `mkdir()` increments the parent's `nlink`
+and then adds the entry; a crash between them leaves the parent counting a
+directory its tree does not contain.  `unlink()` has the mirror image.
+
+What makes the window survivable is that it is repairable, and the
+crash-point suite now says so precisely: `Report` distinguishes a
+*contradiction* from an *incompleteness*, and a link counter that ran ahead of
+the tree is an incompleteness -- `fsck` pass 4 sets `nlink` from the tree, and
+the extra count names an entry that is not there, so nothing can dangle.
+
+The other direction is **not** an incompleteness and stays a contradiction:
+two entries naming an inode whose `nlink` admits one is a reference that will
+dangle when either is removed.  `fsck` cannot tell which entry is the stale
+one, so it must not be handed a state where the answer is a guess.
+
+Closing the window needs the deferral again: hold the counter update until the
+entry is persistent.
+
 ### Two asymmetries worth remembering
 
 **A block's contents need a full write; an inode's image does not.**  A block's

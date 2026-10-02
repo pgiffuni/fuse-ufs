@@ -2424,8 +2424,12 @@ mod crash {
 	// a gated cylinder group.  Removing the gates made three crash points pass
 	// that had been failing for exactly that reason.
 	//
-	// `mkdir` is the one left, and it is a dependency that does not exist yet
-	// rather than a bug.
+	// All eight pass.  `mkdir` needed a distinction rather than a dependency:
+	// a link counter that ran *ahead* of the tree is repairable by `fsck` (it
+	// sets `nlink` from the tree and nothing dangles), while the other
+	// direction is not.  `MkdirParentDep` would close the window; until it
+	// exists the crash state is recorded as an incompleteness rather than
+	// pretended away.
 
 	/// Run `op`, crash after `n` passes, and require the image to be coherent.
 	///
@@ -2531,10 +2535,6 @@ mod crash {
 	/// `mkdir`, which creates an inode, a directory block and two entries in one
 	/// operation.
 	#[test]
-	#[ignore = "found by this suite: mkdir has no dependency between the \
-	            parent's link count and the new entry, so a crash between them \
-	            leaves `nlink` counting a directory the tree does not contain. \
-	            That is `MkdirParentDep` in docs/soft-updates.md, not yet written."]
 	fn a_crash_during_mkdir_never_corrupts() {
 		for n in 0..8 {
 			crash_after("ufs-little", n, |ug| {

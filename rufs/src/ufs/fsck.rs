@@ -527,20 +527,47 @@ impl<R: Backend> Ufs<R> {
 		for (ino, counted) in &nlink_counted {
 			match nlink_on_disk.get(ino) {
 				Some(on_disk) if on_disk == counted => {}
+				// The counter ran ahead of the tree: a link whose entry had not
+				// been persisted when the counter was, or an unlink whose counter
+				// had been and whose entry had not.
+				//
+				// This is the safe direction.  `fsck` pass 4 sets `nlink` from
+				// the tree, and nothing dangles: the extra count names an entry
+				// that is not there, so it cannot be followed.  It is what `mkdir`
+				// looks like from the outside between the parent's link count and
+				// the new entry -- a half-applied operation, which is exactly what
+				// `MkdirParentDep` exists to close and does not yet.
+				Some(on_disk) if on_disk > counted => {
+					rep.incomplete(
+						4,
+						format!(
+							"{ino}: nlink is {on_disk} but the directory tree counts {counted}"
+						),
+					);
+				}
+				// The other direction is not safe.  Two entries naming one inode
+				// whose `nlink` admits one is a reference that will dangle: remove
+				// either and the inode is freed while the other entry still points
+				// at it.
 				Some(on_disk) => {
 					rep.problem(
 						4,
 						format!(
 							"{ino}: nlink is {on_disk} but the directory tree counts {counted}"
 						),
-					)
+					);
 				}
 				None => rep.problem(4, format!("{ino}: reachable but not allocated")),
 			}
 		}
+		// An allocated inode nothing reaches, whose counter still counts links
+		// that are not there.  `fsck` pass 2 finds it through the inode bitmap
+		// and pass 4 clears it; nothing points at it, so nothing can dangle.  An
+		// orphan is what a crash between a counter update and its entry looks
+		// like, in both `mkdir` and `unlink`.
 		for (ino, on_disk) in &nlink_on_disk {
 			if on_disk > &1 && !nlink_counted.contains_key(ino) {
-				rep.problem(
+				rep.incomplete(
 					4,
 					format!("{ino}: nlink is {on_disk} but the inode is unreachable from the root"),
 				);
