@@ -4033,3 +4033,218 @@ mod deferredcrash {
 		}
 	}
 }
+
+/// The mechanisms the brief asks to be tested on their own, rather than only
+/// through whole operations.
+#[cfg(test)]
+mod mechanism {
+	use super::*;
+	use crate::{InodeNum, InodeType};
+
+	fn mkdir(ug: &mut Ufs<std::fs::File>, parent: InodeNum, name: &str) -> InodeNum {
+		ug.mkdir(parent, OsStr::new(name), 0o755, 0, 0).unwrap().inr
+	}
+
+	/// Byte offset of `i_nlink` within `struct ufs2_dinode`.
+	///
+	/// Spelled out rather than looked up, because the test is about the *disk*
+	/// and `Ufs` will only give us the live image.
+	const NLINK_OFF: u64 = 2;
+
+	/// Read an inode's `i_nlink` as the *device* holds it.
+	///
+	/// The cache answers from the live image, so asking it would be asking the
+	/// question in the wrong direction: the whole point is what reached the disk.
+	fn nlink_on_disk(ug: &mut Ufs<std::fs::File>, path: &std::path::Path, inr: InodeNum) -> u32 {
+		use std::io::{Read, Seek, SeekFrom};
+		let off = ug.superblock.ino_to_fso(inr) + NLINK_OFF;
+		let mut f = std::fs::File::open(path).expect("open the image");
+		f.seek(SeekFrom::Start(off)).expect("seek");
+		let mut b = [0u8; 2];
+		f.read_exact(&mut b).expect("read i_nlink");
+		u32::from(u16::from_le_bytes(b))
+	}
+
+	/// Whether a block is free as the *device* holds it.
+	fn block_free_on_disk(ug: &mut Ufs<std::fs::File>, path: &std::path::Path, blk: u64) -> bool {
+		use std::io::{Read, Seek, SeekFrom};
+		let cg = ug.superblock.blk_to_cg(blk);
+		let cgd = ug.read_cg(cg).unwrap();
+		let frag = ug.superblock.blk_to_frag(ug.superblock.blk_to_cgoff(blk));
+		let at = ug.superblock.cg_addr(cg) + cgd.freeoff as u64 + frag / 8;
+		let mut f = std::fs::File::open(path).expect("open the image");
+		f.seek(SeekFrom::Start(at)).expect("seek");
+		let mut b = [0u8; 1];
+		f.read_exact(&mut b).expect("read the block bitmap");
+		// A set bit is a free block in `cg_blksfree`.
+		b[0] & (1 << (frag % 8)) != 0
+	}
+
+	/// A whole-buffer hold leaves the *previous* complete image on the device.
+	///
+	/// This is what distinguishes it from a byte-range gate, and it is the only
+	/// mechanism that can hold back a counter: the device keeps an image that was
+	/// internally consistent rather than a partial one.
+	#[test]
+	fn a_whole_buffer_hold_leaves_the_previous_image_on_the_disk() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		ug.sync_metadata().unwrap();
+		let before = nlink_on_disk(&mut ug, img.path(), InodeNum::ROOT);
+		let live_before = u32::from(ug.read_inode(InodeNum::ROOT).unwrap().nlink);
+		assert_eq!(before, live_before, "the image should start settled");
+
+		mkdir(&mut ug, InodeNum::ROOT, "zzz-hold");
+
+		// Live: the count already includes the new directory.
+		assert_eq!(
+			u32::from(ug.read_inode(InodeNum::ROOT).unwrap().nlink),
+			live_before + 1,
+			"the running filesystem must see the new count"
+		);
+		// On the device: it does not, because the entry that justifies it has not
+		// been written either.  The two agreeing is what makes a crashed image
+		// coherent.
+		assert_eq!(
+			nlink_on_disk(&mut ug, img.path(), InodeNum::ROOT),
+			before,
+			"the count reached the disk before the entry did"
+		);
+
+		// After a drain they move together.
+		ug.sync_metadata().unwrap();
+		assert_eq!(
+			nlink_on_disk(&mut ug, img.path(), InodeNum::ROOT),
+			live_before + 1
+		);
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// Reuse after a deferred free, which the brief calls out as stronger than
+	/// asking whether the image is consistent.
+	#[test]
+	fn a_deferred_free_never_makes_a_reachable_block_reusable() {
+		for n in 0..8 {
+			let (img, mut ug) = testutil::open_rw("ufs-little");
+			let inr = ug
+				.mknod(
+					InodeNum::ROOT,
+					OsStr::new("zzz-ra"),
+					InodeType::RegularFile,
+					0o644,
+					0,
+					0,
+				)
+				.unwrap()
+				.inr;
+			ug.inode_write(inr, 0, &vec![0xa5u8; 32768]).unwrap();
+			ug.sync_metadata().unwrap();
+			let blk = match ug.read_inode(inr).unwrap().data {
+				InodeData::Blocks(b) => b.direct[0] as u64,
+				_ => panic!("no block map"),
+			};
+
+			ug.unlink(InodeNum::ROOT, OsStr::new("zzz-ra")).unwrap();
+			for _ in 0..n {
+				if ug.sync_metadata_one_pass().unwrap() == 0 {
+					break;
+				}
+			}
+			drop(ug);
+
+			// The device, not the cache.
+			let mut ug = Ufs::open(img.path(), true).unwrap();
+			let free = block_free_on_disk(&mut ug, img.path(), blk);
+			let reachable = ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-ra")).is_ok();
+			assert!(
+				!(free && reachable),
+				"reuse-after-free/crash-{n}: block {blk} is reusable while the old \
+				 file still reaches it"
+			);
+			let report = ug.check_consistency().unwrap();
+			assert!(
+				report.is_coherent(),
+				"reuse-after-free/crash-{n}: {report:?}"
+			);
+		}
+	}
+
+	/// After a full drain the block really is reusable, and the file that held it
+	/// is gone -- so a later allocation may take it.
+	#[test]
+	fn a_drained_free_really_does_release_the_block() {
+		let (img, mut ug) = testutil::open_rw("ufs-little");
+		let inr = ug
+			.mknod(
+				InodeNum::ROOT,
+				OsStr::new("zzz-rb"),
+				InodeType::RegularFile,
+				0o644,
+				0,
+				0,
+			)
+			.unwrap()
+			.inr;
+		ug.inode_write(inr, 0, &vec![0xa5u8; 32768]).unwrap();
+		ug.sync_metadata().unwrap();
+		let blk = match ug.read_inode(inr).unwrap().data {
+			InodeData::Blocks(b) => b.direct[0] as u64,
+			_ => panic!("no block map"),
+		};
+		drop(ug);
+
+		let mut ug = Ufs::open(img.path(), true).unwrap();
+		ug.unlink(InodeNum::ROOT, OsStr::new("zzz-rb")).unwrap();
+		ug.sync_metadata().unwrap();
+		assert!(
+			block_free_on_disk(&mut ug, img.path(), blk),
+			"the block was not released"
+		);
+		assert!(ug.dir_lookup(InodeNum::ROOT, OsStr::new("zzz-rb")).is_err());
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+
+	/// Liveness at the filesystem level: deferred work plus repeated drains must
+	/// reach zero.  Every individual invariant can look right while an operation
+	/// can never complete, and that is the failure this catches.
+	#[test]
+	fn pending_work_drains_to_zero() {
+		let (_img, mut ug) = testutil::open_rw("ufs-little");
+		for i in 0..4 {
+			let inr = ug
+				.mknod(
+					InodeNum::ROOT,
+					OsStr::new(&format!("zzz-l{i}")),
+					InodeType::RegularFile,
+					0o644,
+					0,
+					0,
+				)
+				.unwrap()
+				.inr;
+			ug.inode_write(inr, 0, &vec![0x3cu8; 2 * 32768]).unwrap();
+		}
+		for i in 0..4 {
+			ug.unlink(InodeNum::ROOT, OsStr::new(&format!("zzz-l{i}")))
+				.unwrap();
+		}
+		mkdir(&mut ug, InodeNum::ROOT, "zzz-ldir");
+
+		assert!(
+			ug.metadata_status().pending > 0,
+			"no deferred work was made"
+		);
+		let mut rounds = 0;
+		while !ug.metadata_status().is_drained() {
+			ug.sync_metadata().unwrap();
+			rounds += 1;
+			assert!(
+				rounds < 32,
+				"pending work never drained: {:?}",
+				ug.metadata_status()
+			);
+		}
+		assert!(rounds > 0, "one sync was enough; the test proves nothing");
+		assert!(ug.dependencies().validate().is_empty());
+		assert!(ug.check_consistency().unwrap().is_clean());
+	}
+}
