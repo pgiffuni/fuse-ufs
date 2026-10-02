@@ -296,14 +296,31 @@ So the flag, not the queue, is what needs fixing.  Two things are wrong with it:
   write.  A deferred free needs a statement about the filesystem, not about the
   last access.
 
-The right shape is for `BufferCache` to say whether a block's *live image* is on
-the device -- a property of the cache, not a side effect of who last asked --
-and for `note_block_written` to keep it.  That is close to the existing
-`Written::{Safe,Full}` report, but it has to survive the difference between "written
-safely and still gated" and "written in full", which `needs_write()` collapses.
+**Fixed, in `BufferCache::is_persisted()`.**  The cache now owns the answer
+as a property it maintains, rather than as a side channel kept by whoever last
+asked:
 
-Do not build the deferral on the current flag.  Fix the flag first, with a test
-that a buffer written safely and then gated is *not* reported as persisted.
+  * a fetch sets it -- what came back is what the device holds;
+  * `get_mut` clears it -- a mutable borrow is the start of a change;
+  * a write-back sets it -- the safe image if the buffer was gated, the live
+    image otherwise.
+
+The state this makes expressible is a buffer that is **persisted and dirty at
+once**, which is exactly what a safe write leaves behind: the device has
+everything except the gated range, and the buffer is dirty because that range is
+still unsaved.  That single state is why `!is_dirty()` could not answer the
+question -- it reports such a buffer as unsaved, which is true of the gated
+range and false of everything a deferred operation cares about.
+
+`buf::t::persisted_is_not_the_same_as_clean` walks every state including that
+one, and a block the cache has never seen is reported as *not* persisted: the
+cache does not know what is on the device, and guessing would be worse than
+admitting it.  `Ufs` mirrors the flag into the engine for
+`Gate::DirectoryPersisted` and `Gate::PointersRemoved`, which is where the byte
+layer and the dependency layer meet.
+
+The deferral wiring can be built on this now.  It has not been attempted since
+the fix.
 
 ### Two asymmetries worth remembering
 

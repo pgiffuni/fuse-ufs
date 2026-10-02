@@ -320,7 +320,10 @@ pub struct BufferCache {
 	/// keeps the token-to-gate mapping and calls [`Self::release`] when one
 	/// opens, so the dependency types never reach down here.
 	blocked: BTreeMap<u64, BTreeSet<u64>>,
-	stats:   Stats,
+
+	/// Blocks whose current contents are on the device.
+	persisted: BTreeSet<u64>,
+	stats:     Stats,
 }
 
 impl BufferCache {
@@ -333,6 +336,7 @@ impl BufferCache {
 			buffers: BTreeMap::new(),
 			order: VecDeque::new(),
 			blocked: BTreeMap::new(),
+			persisted: BTreeSet::new(),
 			stats: Stats::default(),
 		}
 	}
@@ -374,6 +378,22 @@ impl BufferCache {
 	/// Whether `blk` is held back by any gate.
 	pub fn is_blocked(&self, blk: u64) -> bool {
 		self.blocked.get(&blk).is_some_and(|t| !t.is_empty())
+	}
+
+	/// Whether `blk`'s current contents -- everything not gated -- are on the
+	/// device.
+	///
+	/// This is the question a deferred operation needs answered, and it is *not*
+	/// the same as "is clean".  A buffer that was written safely and not touched
+	/// since is clean, but so is one that was written safely and then gated
+	/// again; the second has unsaved changes and this must say so.
+	///
+	/// It is also not derivable from `is_dirty()` at the point of asking,
+	/// because a dirty buffer may have been written safely and left gated.  The
+	/// answer is a property of the cache, kept up to date by the two events that
+	/// change it -- a fetch and a write.
+	pub fn is_persisted(&self, blk: u64) -> bool {
+		self.persisted.contains(&blk)
 	}
 
 	/// Block size.
@@ -426,6 +446,10 @@ impl BufferCache {
 			self.order.push_back(blk);
 			self.stats.dirty += 1;
 		}
+		// A mutable borrow is the start of a change, so whatever the disk holds
+		// is about to stop being true -- including for a buffer that was
+		// written safely and is now being modified again.
+		self.persisted.remove(&blk);
 		Ok(b)
 	}
 
@@ -473,6 +497,9 @@ impl BufferCache {
 		};
 		dev.write_at(blk * self.bsize, &image)?;
 		self.stats.writes += 1;
+		// A write puts the buffer's current contents on the device: the safe
+		// image if it was gated, the live image otherwise.
+		self.persisted.insert(blk);
 		let b = self.buffers.get_mut(&blk).expect("checked above");
 		b.safe_written = unsafe_;
 		// A safe write-back does *not* clean the buffer: the live image still
@@ -555,6 +582,10 @@ impl BufferCache {
 		let mut data = vec![0u8; self.bsize as usize];
 		dev.read_at(blk * self.bsize, &mut data)?;
 		self.stats.reads += 1;
+		// What came back is what the device holds, so the block is persisted
+		// until something modifies it.  A fetch that finds it already cached is
+		// not a fetch at all and leaves the answer alone.
+		self.persisted.insert(blk);
 		self.buffers.insert(
 			blk,
 			Buffer {
@@ -892,5 +923,51 @@ mod t {
 		assert_eq!(c.write_back(&mut d, 1).unwrap(), Written::Full);
 		assert_eq!(&d.writes[3].1[0..8], &9u64.to_le_bytes());
 		assert!(!c.peek(1).unwrap().is_dirty());
+	}
+
+	/// `is_persisted` is the question a deferred operation asks, and it is not
+	/// the same as "is clean".  These are the four states, and the fourth is the
+	/// one a dirty flag cannot see.
+	#[test]
+	fn persisted_is_not_the_same_as_clean() {
+		let mut c = cache();
+		let mut d = dev();
+
+		// A fresh fetch: what came back is what the disk holds.
+		c.get(&mut d, 0).unwrap();
+		assert!(c.is_persisted(0));
+		assert!(!c.peek(0).unwrap().is_dirty());
+
+		// Modified: not persisted.
+		c.get_mut(&mut d, 0).unwrap().data[0] = 1;
+		assert!(!c.is_persisted(0));
+
+		// Written in full: persisted, and clean.
+		c.write_back(&mut d, 0).unwrap();
+		assert!(c.is_persisted(0));
+
+		// Written safely and left gated: **persisted and dirty at the same
+		// time**.  The device has everything except the gated range, and the
+		// buffer is dirty precisely because that range is still unsaved.
+		//
+		// This single state is why `!is_dirty()` cannot answer the question: it
+		// reports this buffer as unsaved, which is true of the gated range and
+		// false of everything a deferred operation cares about.
+		c.get_mut(&mut d, 0).unwrap().mark_unsafe(0, 4);
+		assert_eq!(c.write_back(&mut d, 0).unwrap(), Written::Safe);
+		assert!(c.is_persisted(0));
+		assert!(c.peek(0).unwrap().is_dirty());
+
+		// The state a dirty flag cannot express: persisted by a safe write, and
+		// then modified again.  It has unsaved changes, so it is *not*
+		// persisted -- while `is_dirty()` alone would have been needed to know
+		// that, and would have been the wrong reason.
+		c.get_mut(&mut d, 0).unwrap().data[0] = 2;
+		assert!(!c.is_persisted(0));
+		assert!(c.peek(0).unwrap().is_dirty());
+
+		// A block the cache has never seen is not persisted: the cache does not
+		// know what is on the device, and guessing would be worse.
+		assert!(!c.is_persisted(99));
 	}
 }

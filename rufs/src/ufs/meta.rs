@@ -141,13 +141,19 @@ impl<R: Backend> Ufs<R> {
 	/// `readdir` has to see a directory entry that Soft Updates is still
 	/// holding back.
 	pub(super) fn metadata_block(&mut self, blk: u64) -> IoResult<&[u8]> {
+		// A block that was not in the cache is about to be read from the
+		// device, so whatever comes back is what the disk holds.  A block that
+		// *was* in the cache is left alone: its answer is whatever the last
+		// write or the last modification said, and re-deriving it from the
+		// dirty flag on every read is what made a *pending* free look like it
+		// had already run.
+		let fresh = !self.buf.is_resident(blk);
 		let Self { file, buf, .. } = self;
 		buf.get(file, blk)?;
 		let b = buf.peek(blk).expect("just fetched");
-		// A buffer that is not dirty was last written in full, so its contents
-		// are the disk's.  That is what "a pointer in it is persistently gone"
-		// means, and `DependencyEngine` needs to be told.
-		self.softdep.set_container_persisted(blk, !b.is_dirty());
+		if fresh {
+			self.softdep.set_container_persisted(blk, true);
+		}
 		Ok(b.data())
 	}
 
@@ -161,6 +167,11 @@ impl<R: Backend> Ufs<R> {
 		let out = buf.get_mut(file, blk);
 		// Handing out a mutable buffer is the start of a change, so whatever the
 		// disk holds is about to stop being true.
+		//
+		// This is the *only* place that clears the flag, and it clears it for
+		// every buffer, not only the dirty ones: a buffer that was written
+		// safely and is now being modified again is not persisted, and
+		// `is_dirty()` would say so only by accident.
 		self.softdep.set_container_persisted(blk, false);
 		out
 	}
