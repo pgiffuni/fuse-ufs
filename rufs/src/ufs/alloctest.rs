@@ -3145,81 +3145,11 @@ mod syncsem {
 	}
 }
 
-/// Randomised operation sequences, with a crash injected at a deterministic
-/// point.
-///
-/// The hand-written crash points each cover one operation at one stage.  This
-/// covers combinations none of them think of: an unlink that races a truncate, a
-/// rename into a directory that is itself being drained, a file that is created,
-/// written, truncated and unlinked across three separate crash points.
-///
-/// Seeds are fixed, so a failure names a seed that reproduces it exactly and the
-/// sequence can be replayed by hand.
-///
-/// Two invariants are checked after every step:
-///
-///  * **coherence** -- the image never contradicts itself, however it was cut.
-///    This is the one that must hold at every crash point, and it is what
-///    `check_consistency()` checks;
-///  * **drained** -- after a *complete* sync nothing is outstanding, so the
-///    disk holds the whole story.  A filesystem that quietly accumulates
-///    unpublished work would pass every crash test and be useless.
-///
-///
-/// # Findings, in the order the seeds produced them
-///
-/// **Seed 12, step 1 -- `truncate` on a directory.**  `mkdir`, then `truncate`
-/// the new directory.  `inode_truncate` had no kind check, so truncating it to
-/// zero freed the blocks holding its `.` and `..` -- which are how the directory
-/// is found at all.  The checker then read a freed and reallocated block as a
-/// directory and found seven entries all named `.`, each naming a different
-/// inode.  Fixed: `Ufs::truncate()` enforces `EISDIR`, and `inode_truncate`
-/// stays the unrestricted primitive because `mkdir` uses it.
-///
-/// **Seed 10, step 4 -- `rmdir` and the parent's link count.**  Not a missing
-/// decrement: removing `..` is what takes the link off the parent, correctly and
-/// once.  A missing *ordering* -- the decrement reached the disk before the entry
-/// removal did.  Fixed with `block_inode_on_dir`, the hold-back `mkdir` uses.
-///
-/// **Seed 14, step 7 -- `rename` and link counts.  Open.**  The root ends at
-/// `nlink` 6 against a tree of 7, and inode 515 at 3 against 2.  The count too
-/// *low* is the dangerous direction: `fsck` trusts the tree and raises it, so
-/// the damage is bounded, but a root whose `nlink` understates its subdirectories
-/// looks removable to anything reasoning from the count alone.
-///
-/// Seed 10 first showed this as an incompleteness -- a count too *high*, which
-/// `fsck` pass 4 simply overwrites -- and it was recorded as a fidelity gap rather
-/// than a bug.  Seed 14 shows the other direction, and the checker classes it as
-/// a contradiction.
-///
-/// The cause is structural.  `rename` removes the destination entry and the
-/// source entry with `unlink`, and `unlink` drops a link from the *named inode*,
-/// never from a parent.  A directory's link on its parent is only taken by
-/// removing the `..` that names that parent, which `unlink` does not do and only
-/// `rmdir` does.  So renaming a directory moves it with neither parent's count
-/// moving, and renaming one *over* a directory leaves the replaced directory's
-/// parent still counting it.
-///
-/// The fix is not a `nlink -= 1` in `rename`.  It is the model FreeBSD uses: a
-/// directory rename is three operations -- remove the destination, insert the
-/// source, rewrite the destination's `..` -- and the counts follow from that.
-/// Doing it piecemeal here would produce exactly the kind of plausible-looking
-/// decrement this paragraph is a warning about.
-///
-/// Two lessons from this test, both paid for.  A seed is only half a report; the
-/// sequence is the other half, which is why `run_seed` prints what it did.  And a
-/// property test that cannot be satisfied without weakening its assertion is
-/// telling you something -- the first version of this note blamed `newdir`, and
-/// replaying the prefix by hand disproved it.
-///
-/// To reproduce the open finding:
-///
-/// ```text
-/// cargo test -p rufs --ignore-rust-version random_sequences -- --ignored
-/// ```
-///
-/// Not a memory-safety test: nothing here is unchecked or unsafe.
 /// Renaming a directory, which is three operations rather than two.
+///
+/// `rename` used to remove both entries and stop there, which left neither
+/// parent's `i_nlink` moved and the moved directory's `..` naming the old
+/// parent.  These are the properties that has to have.
 #[cfg(test)]
 mod renamedir {
 	use super::*;
@@ -3446,6 +3376,68 @@ mod renamedir {
 }
 
 #[cfg(test)]
+/// Randomised operation sequences, with a crash injected at a deterministic
+/// point.
+///
+/// The hand-written crash points each cover one operation at one stage.  This
+/// covers combinations none of them think of: an unlink racing a truncate, a
+/// rename moving a directory between two others, a file created, written,
+/// truncated and unlinked across three separate crash points.
+///
+/// Forty-eight fixed seeds, alternating little- and big-endian images, each
+/// running up to fourteen operations drawn from create, mkdir, unlink, rmdir,
+/// truncate and rename, with a crash injected in roughly one step in eight.
+/// No dependency and no `unsafe`: a `wrapping_mul` generator and
+/// `check_consistency()`.
+///
+/// Two invariants, and the distinction between them is the point:
+///
+///  * **coherence** after a crash -- the disk may be mid-operation but must
+///    never contradict itself;
+///  * **drained** after a *complete* sync -- nothing outstanding, so the disk
+///    holds the whole story.  A filesystem that quietly accumulated unpublished
+///    work would pass every crash test and be useless.
+///
+/// The test also asserts that some seeds crash and some run to the end, or it
+/// proves nothing about the crash path.  That guard earned its keep: at a
+/// one-in-four crash rate over fourteen steps the chance a seed sees no crash at
+/// all is about 2%, so every seed crashed and the post-drain path went
+/// unexercised.
+///
+/// # What it found
+///
+/// All three are fixed, and none of them was where the symptom pointed.
+///
+/// **`truncate` on a directory** (seed 12).  `inode_truncate` had no kind check,
+/// so truncating a directory to zero freed the blocks holding its `.` and `..` --
+/// which are how the directory is found at all.  The symptom was seven entries
+/// in one directory all named `.`, each naming a different inode: the checker
+/// reading a freed, reallocated block as a directory.
+///
+/// **`rmdir` and the parent's link count** (seed 10, step 4).  Not a missing
+/// decrement -- removing `..` is what takes the link off the parent, correctly
+/// and once -- but a missing *ordering*: the decrement reached the disk before
+/// the entry removal did.
+///
+/// **`rename` and directory link counts** (seed 14, step 7).  The root ended at
+/// `nlink` 6 against a tree of 7, and inode 515 at 3 against 2.  Structural
+/// rather than a missing decrement: `rename` removed both entries with
+/// `unlink`, which drops a link from the *named inode* and never from a parent,
+/// while a directory's link on its parent is only taken by removing the `..` that
+/// names it -- which only `rmdir` does.  A directory rename is three operations,
+/// not two.
+///
+/// # Two lessons, both paid for
+///
+/// A seed is only half a report; the sequence is the other half, which is why
+/// `run_seed` prints what it did.  The first version of this note blamed
+/// `newdir` for seed 12, and replaying the prefix by hand disproved it while
+/// proving nothing else wrong.
+///
+/// And a property test that cannot be satisfied without weakening its assertion
+/// is telling you something.  Two of the findings above came from an assertion
+/// that refused to be loosened; a third came only after loosening one was
+/// considered and rejected.
 mod random {
 	use super::*;
 	use crate::{InodeNum, InodeType};
@@ -3766,7 +3758,7 @@ mod random {
 #[cfg(test)]
 mod renamelink {
 	use super::*;
-	use crate::{InodeNum, InodeType};
+	use crate::InodeNum;
 
 	fn mkdir(ug: &mut Ufs<std::fs::File>, parent: InodeNum, name: &str) -> InodeNum {
 		ug.mkdir(parent, OsStr::new(name), 0o755, 0, 0).unwrap().inr
